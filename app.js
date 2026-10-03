@@ -7,13 +7,32 @@ const LS = {
   del(k) { try { localStorage.removeItem('onegit.' + k); } catch (e) {} }
 };
 let TOKEN = LS.get('token', null);
+let TOKEN_SCOPES = LS.get('tokenScopes', null);
+/* what kind of credential is the current account signed in with */
+function loginMethod() {
+  const t = TOKEN || '';
+  if (t.startsWith('github_pat_')) return 'fine';
+  if (t.startsWith('gho_')) return 'oauth';
+  if (t.startsWith('ghp_')) return 'classic';
+  if (t.startsWith('ghu_')) return 'app';
+  return 'token';
+}
+function loginMethodLabel() {
+  switch (loginMethod()) {
+    case 'fine': return 'Fine-grained personal access token (github_pat_)';
+    case 'classic': return 'Personal access token, classic (ghp_)';
+    case 'oauth': return 'GitHub sign-in, device flow';
+    case 'app': return 'GitHub App user token';
+    default: return 'Personal access token';
+  }
+}
 let RSEQ = 0;
 let lastOfflineToast = 0;
 const API_MEM = {};
 /* real version from the installed package (never goes stale when rebuilding);
    the constant is only a fallback for very old builds without the bridge */
-const APPV = (window.OneGit && window.OneGit.appVersion ? String(window.OneGit.appVersion() || '') : '') || '2.68';
-const UPD_REPO = 'BonkerUnkilBonki/OneGit';
+const APPV = (window.OneGit && window.OneGit.appVersion ? String(window.OneGit.appVersion() || '') : '') || '3.02';
+const UPD_REPO = 'BonkerUnkilBonki/Gitly-Update';
 /* when this app was installed/updated - ANY release published after this
    moment counts as an update, no version parsing at all */
 const INSTALLED_AT = (window.OneGit && window.OneGit.appInstallTime ? Number(window.OneGit.appInstallTime() || 0) : 0);
@@ -96,6 +115,9 @@ async function api(path, opts = {}) {
     }
     throw netErr;
   }
+  /* remember which scopes the current token actually has (header is present
+     on classic PATs and OAuth tokens; fine-grained tokens return an empty list) */
+  try { const sc = res.headers.get('X-OAuth-Scopes'); if (typeof sc === 'string') { TOKEN_SCOPES = sc; LS.set('tokenScopes', sc); } } catch (e) {}
   if (res.status === 401) { if (USER) doLogout('Session expired — sign in again'); throw new Error('Invalid or expired token'); }
   if (opts.status) { const d = await res.json().catch(() => null); return { status: res.status, ok: res.ok, data: d }; }
   if (res.status === 204) return null;
@@ -155,6 +177,8 @@ function applyTheme() {
   let accHex = '';
   try { accHex = getComputedStyle(rt).getPropertyValue('--accent').trim(); } catch (e) {}
   if (/^#[0-9A-Fa-f]{6}$/.test(accHex)) {
+    /* keep the home screen widgets in the same colour as the app */
+    try { if (window.OneGit && OneGit.widgetAccent) OneGit.widgetAccent(accHex.toUpperCase()); } catch (e) {}
     const ch = v => { const c = parseInt(v, 16) / 255; return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4); };
     const L = 0.2126 * ch(accHex.slice(1, 3)) + 0.7152 * ch(accHex.slice(3, 5)) + 0.0722 * ch(accHex.slice(5, 7));
     rt.style.setProperty('--accentText', L > 0.45 ? '#151515' : '#fff');
@@ -279,7 +303,6 @@ function showChangelogSheet(rel) {
 }
 async function checkUpdate() {
   if (UPD_CHECKED || !TOKEN) return;
-  if (!window.OneGit) return; /* web build: the Android release updater does not apply here */
   UPD_CHECKED = true;
   try {
     const rel = await latestPublishedRelease();
@@ -321,6 +344,8 @@ function doLogout(msg) {
 function saveTokenNative() { try { if (TOKEN && window.OneGit && window.OneGit.saveToken) window.OneGit.saveToken(TOKEN); } catch (e) {} }
 function showLogin() {
   $('#app').hidden = true; $('#login').hidden = false;
+  const lv = $('#loginVer');
+  if (lv) lv.textContent = 'Gitly v' + APPV;
   let cb = document.getElementById('loginCancel');
   if (!cb) {
     cb = document.createElement('button');
@@ -332,6 +357,23 @@ function showLogin() {
     const card = document.querySelector('#login .logincard');
     if (card) card.appendChild(cb);
   }
+  /* resume a pending GitHub device sign-in */
+  let fb = document.getElementById('oauthFinish');
+  const pend = oauthPending();
+  if (pend) {
+    if (!fb) {
+      fb = document.createElement('button');
+      fb.id = 'oauthFinish';
+      fb.className = 'btn ghost';
+      fb.style.cssText = 'display:block;margin:14px auto 0;width:260px';
+      fb.addEventListener('click', () => { showDeviceSheet(); oauthPollNow(); });
+      const lc = document.querySelector('#login .logincard');
+      if (lc && lc.parentNode) lc.parentNode.insertBefore(fb, lc.nextSibling);
+    }
+    fb.textContent = 'Continue — finish GitHub sign-in';
+    fb.hidden = false;
+    if (!oauthTimer) scheduleOauthPoll();
+  } else if (fb) fb.hidden = true;
   cb.hidden = !TOKEN;
 }
 
@@ -386,6 +428,12 @@ const ROUTES = [
   { re: /^#\/repo\/([^\/]+)\/([^\/]+)\/commits$/, tab: 1, detail: true, title: () => 'Commits', sub: m => m[1] + ' / ' + m[2], render: m => renderCommits(m[1], m[2]) },
   { re: /^#\/repo\/([^\/]+)\/([^\/]+)\/releases$/, tab: 1, detail: true, title: () => 'Releases', sub: m => m[1] + ' / ' + m[2], render: m => renderReleases(m[1], m[2]) },
   { re: /^#\/repo\/([^\/]+)\/([^\/]+)\/issues$/, tab: 1, detail: true, title: () => 'Issues', sub: m => m[1] + ' / ' + m[2], render: m => renderRepoIssues(m[1], m[2]) },
+  { re: /^#\/repo\/([^\/]+)\/([^\/]+)\/pulls$/, tab: 1, detail: true, title: () => 'Pull requests', sub: m => m[1] + ' / ' + m[2], render: m => renderPulls(m[1], m[2]) },
+  { re: /^#\/repo\/([^\/]+)\/([^\/]+)\/actions$/, tab: 1, detail: true, title: () => 'Actions', sub: m => m[1] + ' / ' + m[2], render: m => renderActions(m[1], m[2]) },
+  { re: /^#\/repo\/([^\/]+)\/([^\/]+)\/security$/, tab: 1, detail: true, title: () => 'Security and quality', sub: m => m[1] + ' / ' + m[2], render: m => renderSecurity(m[1], m[2]) },
+  { re: /^#\/repo\/([^\/]+)\/([^\/]+)\/insights$/, tab: 1, detail: true, title: () => 'Insights', sub: m => m[1] + ' / ' + m[2], render: m => renderInsights(m[1], m[2]) },
+  { re: /^#\/actionrun\/([^\/]+)\/([^\/]+)\/(\d+)$/, tab: 1, detail: true, title: () => 'Workflow run', sub: m => m[1] + ' / ' + m[2], render: m => renderRun(m[1], m[2], +m[3]) },
+  { re: /^#\/repo\/([^\/]+)\/([^\/]+)\/settings$/, tab: 1, detail: true, title: () => 'Settings', sub: m => m[1] + ' / ' + m[2], render: m => renderRepoSettings(m[1], m[2]) },
   { re: /^#\/repo\/([^\/]+)\/([^\/]+)$/, tab: 1, detail: true, title: m => m[2], sub: m => m[1] + ' / ' + m[2], render: m => renderRepo(m[1], m[2]) },
   { re: /^#\/commit\/([^\/]+)\/([^\/]+)\/([0-9a-fA-F]{6,40})$/, tab: -1, detail: true, title: () => 'Commit', sub: m => m[1] + ' / ' + m[2], render: m => renderCommit(m[1], m[2], m[3]) },
   { re: /^#\/commitfile\/([^\/]+)\/([^\/]+)\/([0-9a-fA-F]{6,40})\/(.+)$/, tab: -1, detail: true, title: m => decodeURIComponent(m[4]).split('/').pop(), sub: m => m[1] + ' / ' + m[2] + ' \u00b7 ' + m[3].slice(0, 7), render: m => renderCommitFile(m[1], m[2], m[3], decodeURIComponent(m[4])) },
@@ -395,6 +443,7 @@ const ROUTES = [
   { re: /^#\/commits$/, tab: 2, detail: false, title: () => 'Commits', sub: () => 'Your commits across every repository', render: renderCommitsHome },
   { re: /^#\/issues$/, tab: -1, detail: false, title: () => 'Issues', sub: () => 'Issues and pull requests', render: renderIssues },
   { re: /^#\/notifs$/, tab: -1, detail: false, title: () => 'Notifications', sub: () => 'Your unread threads', render: renderNotifs },
+  { re: /^#\/users\/([^\/]+)\/repos$/, tab: -1, detail: true, title: () => 'Repositories', sub: m => '@' + m[1], render: m => renderUserRepos(m[1]) },
   { re: /^#\/users\/([^\/]+)\/(followers|following)$/, tab: -1, detail: true, title: m => m[2][0].toUpperCase() + m[2].slice(1), sub: m => '@' + m[1], render: m => renderUserList(m[1], m[2]) },
   { re: /^#\/user\/([^\/]+)\/gists$/, tab: -1, detail: true, title: () => 'Gists', sub: m => '@' + m[1], render: m => renderGists(m[1]) },
   { re: /^#\/gist\/([0-9a-f]+)$/, tab: -1, detail: true, title: () => 'Gist', sub: () => 'Snippet files', render: m => renderGist(m[1]) },
@@ -424,6 +473,7 @@ function fitBigTitle() {
 
 async function route() {
   applyTheme();
+  applyA11y();
   if (!TOKEN) { showLogin(); return; }
   $('#login').hidden = true; $('#app').hidden = false;
   if (!USER) {
@@ -592,39 +642,88 @@ const MD_DL_EXTS = ' pdf txt log csv tsv json yaml yml rtf doc docx xls xlsx ppt
    the git blobs API, which serves base64 up to GitHub's 100 MB limit. */
 const RAWIMG_CACHE = {};
 const MD_MIME = { png:'image/png', jpg:'image/jpeg', jpeg:'image/jpeg', gif:'image/gif', webp:'image/webp', svg:'image/svg+xml', bmp:'image/bmp', ico:'image/x-icon', mp4:'video/mp4', mov:'video/quicktime', webm:'video/webm' };
+const RAWIMG_PROM = {};
+/* label a data: URI correctly - trust the server unless it sends something generic */
+function imgMime(ct, path) {
+  const ext = ((path || '').split('?')[0].split('.').pop() || '').toLowerCase();
+  const byExt = MD_MIME[ext];
+  const c = (ct || '').split(';')[0].trim().toLowerCase();
+  if (!c || c === 'application/octet-stream' || c === 'text/plain' || c === 'binary/octet-stream') return byExt || 'application/octet-stream';
+  if (c === 'image/svg' || c === 'text/xml' || c === 'application/xml') return 'image/svg+xml';
+  return c;
+}
+/* small images are remembered in localStorage, so re-opening a README never
+   re-downloads them and animated art (the contribution snake, gifs) is not restarted */
+function lsImgGet(key) { try { return LS.get('img:' + key, null); } catch (e) { return null; } }
+function lsImgSet(key, data) {
+  try {
+    if (!data || data.length > 120000) return;
+    let idx = LS.get('imgIdx', []) || [];
+    if (idx.indexOf(key) === -1) idx.push(key);
+    while (idx.length > 25) { const old = idx.shift(); try { LS.del('img:' + old); } catch (e) {} }
+    LS.set('img:' + key, data); LS.set('imgIdx', idx);
+  } catch (e) {}
+}
 async function ghRawToData(o, n, path, ref) {
   ref = ref || 'HEAD';
+  path = String(path).split('#')[0].split('?')[0];
   const key = o + '/' + n + '/' + ref + '/' + path;
   if (RAWIMG_CACHE[key]) return RAWIMG_CACHE[key];
-  const headers = { 'Accept': 'application/vnd.github.raw', 'X-GitHub-Api-Version': '2022-11-28' };
-  if (TOKEN) headers.Authorization = 'Bearer ' + TOKEN;
+  if (RAWIMG_PROM[key]) return RAWIMG_PROM[key]; /* one fetch per image, ever */
+  const saved = lsImgGet(key);
+  if (saved) { RAWIMG_CACHE[key] = saved; return saved; }
+  const job = (async () => {
+    const headers = { 'Accept': 'application/vnd.github.raw', 'X-GitHub-Api-Version': '2022-11-28' };
+    if (TOKEN) headers.Authorization = 'Bearer ' + TOKEN;
+    const url = 'https://api.github.com/repos/' + o + '/' + n + '/contents/' + path + '?ref=' + encodeURIComponent(ref);
+    try {
+      const res = await fetch(url, { headers, cache: 'no-store' });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const ct = res.headers.get('content-type') || '';
+      const buf = new Uint8Array(await res.arrayBuffer());
+      let bin = '';
+      for (let i = 0; i < buf.length; i += 0x8000) bin += String.fromCharCode.apply(null, buf.subarray(i, i + 0x8000));
+      const data = 'data:' + imgMime(ct, path) + ';base64,' + btoa(bin);
+      if (buf.length < 8 * 1024 * 1024) { RAWIMG_CACHE[key] = data; lsImgSet(key, data); }
+      return data;
+    } catch (e) {
+      /* too big for the contents endpoint - fetch the blob's base64 instead */
+      const h2 = { 'X-GitHub-Api-Version': '2022-11-28' };
+      if (TOKEN) h2.Authorization = 'Bearer ' + TOKEN;
+      const meta = await fetch(url, { headers: h2, cache: 'no-store' });
+      if (!meta.ok) throw new Error('HTTP ' + meta.status);
+      const j = await meta.json();
+      if (!j || !j.sha) throw new Error('no sha');
+      const bl = await fetch('https://api.github.com/repos/' + o + '/' + n + '/git/blobs/' + j.sha, { headers: h2, cache: 'no-store' });
+      if (!bl.ok) throw new Error('HTTP ' + bl.status);
+      const b = await bl.json();
+      if (!b || b.encoding !== 'base64' || !b.content) throw new Error('no blob content');
+      const data2 = 'data:' + imgMime('', path) + ';base64,' + b.content.replace(/\s/g, '');
+      if ((b.size || 0) < 8 * 1024 * 1024) { RAWIMG_CACHE[key] = data2; lsImgSet(key, data2); }
+      return data2;
+    }
+  })();
+  RAWIMG_PROM[key] = job;
+  job.then(() => { delete RAWIMG_PROM[key]; }, () => { delete RAWIMG_PROM[key]; });
+  return job;
+}
+/* turn any GitHub file URL - raw.githubusercontent.com, github.com/.../blob/...,
+   github.com/.../raw/... - into owner/repo/ref/path for the contents API.
+   Query strings such as ?raw=true are dropped: the API rejects them, which is
+   what left the contribution snake and other README art broken before. */
+function ghFileFromUrl(u) {
   try {
-    const res = await fetch('https://api.github.com/repos/' + o + '/' + n + '/contents/' + path + '?ref=' + encodeURIComponent(ref), { headers, cache: 'no-store' });
-    if (!res.ok) throw new Error('HTTP ' + res.status);
-    const ct = res.headers.get('content-type') || 'application/octet-stream';
-    const buf = new Uint8Array(await res.arrayBuffer());
-    let bin = '';
-    for (let i = 0; i < buf.length; i += 0x8000) bin += String.fromCharCode.apply(null, buf.subarray(i, i + 0x8000));
-    const data = 'data:' + ct.split(';')[0] + ';base64,' + btoa(bin);
-    if (buf.length < 8 * 1024 * 1024) RAWIMG_CACHE[key] = data; // cache small ones only
-    return data;
-  } catch (e) {
-    /* too big for the contents endpoint - fetch the blob's base64 instead */
-    const h2 = { 'X-GitHub-Api-Version': '2022-11-28' };
-    if (TOKEN) h2.Authorization = 'Bearer ' + TOKEN;
-    const meta = await fetch('https://api.github.com/repos/' + o + '/' + n + '/contents/' + path + '?ref=' + encodeURIComponent(ref), { headers: h2, cache: 'no-store' });
-    if (!meta.ok) throw new Error('HTTP ' + meta.status);
-    const j = await meta.json();
-    if (!j || !j.sha) throw new Error('no sha');
-    const bl = await fetch('https://api.github.com/repos/' + o + '/' + n + '/git/blobs/' + j.sha, { headers: h2, cache: 'no-store' });
-    if (!bl.ok) throw new Error('HTTP ' + bl.status);
-    const b = await bl.json();
-    if (!b || b.encoding !== 'base64' || !b.content) throw new Error('no blob content');
-    const ct2 = MD_MIME[(path.split('.').pop() || '').toLowerCase()] || 'application/octet-stream';
-    const data2 = 'data:' + ct2 + ';base64,' + b.content.replace(/\s/g, '');
-    if ((b.size || 0) < 8 * 1024 * 1024) RAWIMG_CACHE[key] = data2;
-    return data2;
-  }
+    const url = new URL(String(u));
+    let m;
+    if (url.hostname === 'raw.githubusercontent.com') {
+      m = url.pathname.match(/^\/([^\/]+)\/([^\/]+)\/([^\/]+)\/(.+)$/);
+      if (m) return { owner: m[1], repo: m[2], ref: m[3], path: decodeURIComponent(m[4]) };
+    } else if (url.hostname === 'github.com' || url.hostname === 'www.github.com') {
+      m = url.pathname.match(/^\/([^\/]+)\/([^\/]+)\/(?:blob|raw)\/([^\/]+)\/(.+)$/);
+      if (m) return { owner: m[1], repo: m[2], ref: m[3], path: decodeURIComponent(m[4]) };
+    }
+  } catch (e) {}
+  return null;
 }
 /* GitHub rewrites every external README image to a camo.githubusercontent.com
    proxy URL, and that host is unreachable on some networks. The hex segment of
@@ -669,23 +768,102 @@ function mdImgFallback(img) {
 }
 /* after README/issue HTML lands in the DOM, inline every raw.githubusercontent
    image and unmask every camo one; if the fetch fails the original URL stays */
+/* load an <img> from the first source that works; if they all fail the broken
+   icon is replaced by a tappable link, so nothing is ever left unreadable */
+function imgFallbackChain(img, sources) {
+  const list = sources.filter(Boolean);
+  let i = 0;
+  const step = () => {
+    if (i >= list.length) { markImgBroken(img, list[0]); return; }
+    let s = list[i++];
+    if (typeof s === 'function') { try { s = s(); } catch (e) { return step(); } }
+    const use = d => { img.onerror = () => { img.onerror = null; step(); }; img.src = d; };
+    if (s && typeof s.then === 'function') s.then(use).catch(step);
+    else use(s);
+  };
+  step();
+}
+function markImgBroken(img, url) {
+  try {
+    img.onerror = null;
+    const alt = img.getAttribute('alt') || 'image';
+    const a = document.createElement('a');
+    a.className = 'imgfallback';
+    a.setAttribute('data-act', 'ext');
+    a.setAttribute('data-url', url || '');
+    a.textContent = alt + ' — tap to open';
+    if (img.parentNode) img.parentNode.replaceChild(a, img);
+  } catch (e) {}
+}
+/* after README/issue HTML lands in the DOM, inline every repository image and
+   unmask every camo one; each image is fetched once, and any that cannot be
+   loaded at all becomes a link instead of a broken icon */
+/* GitHub serves modern README art - the contribution snake above all - inside
+   a <picture> with <source srcset> dark/light variants, and the browser picks
+   the image from the SOURCE, not from <img src>. Inlining only the img left the
+   browser fetching the blocked raw URL, so the snake never appeared. Every
+   source is resolved too, and any that cannot be fetched is dropped so the
+   <img> fallback takes over. */
+function inlinePictureSources(el) {
+  el.querySelectorAll('picture').forEach(pic => {
+    pic.querySelectorAll('source').forEach(s => {
+      if (s.dataset.gi) return;
+      s.dataset.gi = '1';
+      const first = (s.getAttribute('srcset') || '').split(',')[0].trim().split(/\s+/)[0];
+      if (!first || first.indexOf('data:') === 0) return;
+      const f = ghFileFromUrl(first);
+      if (!f) return;
+      ghRawToData(f.owner, f.repo, f.path, f.ref)
+        .then(d => { try { s.setAttribute('srcset', d); } catch (e) {} })
+        .catch(() => { try { s.remove(); } catch (e) {} });
+    });
+  });
+}
+/* after README/issue HTML lands in the DOM, inline every repository image and
+   unmask every camo one; each image is fetched once, and any that cannot be
+   loaded at all becomes a link instead of a broken icon */
 function inlineRepoImages(el) {
   if (!el || !el.querySelectorAll) return;
+  inlinePictureSources(el);
   el.querySelectorAll('img').forEach(img => {
+    if (img.dataset.gi) return; /* already handled - never fetch the same image twice */
     const src = img.getAttribute('src') || '';
-    if (!src) return;
+    if (!src || src.indexOf('data:') === 0) { img.dataset.gi = '1'; return; }
+    img.dataset.gi = '1';
+    /* an img srcset wins over src in the browser - inline it too, or drop it
+       so the src we control is what actually gets loaded */
+    if (img.hasAttribute('srcset')) {
+      const first = (img.getAttribute('srcset') || '').split(',')[0].trim().split(/\s+/)[0];
+      const fs = first ? ghFileFromUrl(first) : null;
+      if (fs) ghRawToData(fs.owner, fs.repo, fs.path, fs.ref).then(d => { try { img.setAttribute('srcset', d); } catch (e) {} }).catch(() => { try { img.removeAttribute('srcset'); } catch (e) {} });
+      else { try { img.removeAttribute('srcset'); } catch (e) {} }
+    }
+    let real = src;
     if (/^https:\/\/camo\.githubusercontent\.com\//.test(src)) {
-      const real = camoDecode(src);
-      if (!real) return;
-      const rm = real.match(/^https:\/\/raw\.githubusercontent\.com\/([^/]+)\/([^/]+)\/([^/]+)\/(.+)$/);
-      if (rm) { setImgData(img, ghRawToData(rm[1], rm[2], rm[4], rm[3])); return; }
-      img.src = real; /* an ordinary host - load it directly, skip the blocked proxy */
-      mdImgFallback(img);
+      const dec = camoDecode(src);
+      if (dec) real = dec;
+    }
+    const f = ghFileFromUrl(real);
+    if (f) {
+      /* repository file: the API route first (raw.githubusercontent is blocked
+         on many networks), then the direct URL, then the native bridge */
+      imgFallbackChain(img, [
+        ghRawToData(f.owner, f.repo, f.path, f.ref),
+        real,
+        () => nativeMedia(real)
+      ]);
       return;
     }
-    const m = src.match(/^https:\/\/raw\.githubusercontent\.com\/([^/]+)\/([^/]+)\/([^/]+)\/(.+)$/);
-    if (m) setImgData(img, ghRawToData(m[1], m[2], m[4], m[3]));
-    else if (/^https:/.test(src)) mdImgFallback(img);
+    if (/^https:/.test(real)) {
+      imgFallbackChain(img, [real, src, () => nativeMedia(real)]);
+      return;
+    }
+    /* repo-relative or unknown scheme: try to resolve it against the repo */
+    const rel = real.replace(/^\.\//, '');
+    if (el.dataset && el.dataset.repo) {
+      const parts = el.dataset.repo.split('/');
+      imgFallbackChain(img, [ghRawToData(parts[0], parts[1], rel, 'HEAD'), () => nativeMedia(src)]);
+    }
   });
   /* embedded videos: if the WebView cannot stream one, fetch it natively */
   el.querySelectorAll('video, video source').forEach(v => {
@@ -732,6 +910,7 @@ function prodHtml(cc) {
   const repos = (cc.commitContributionsByRepository || []).slice()
     .sort((a, b) => b.contributions.totalCount - a.contributions.totalCount).slice(0, 5);
   let html = '<div class="card"><div class="ltitle" style="margin-bottom:10px">Contribution graph · last 12 months</div>' + graph + legend + '</div>';
+  html += activityRadar(cc);
   html += '<h2 class="sect">Right now</h2><div class="card"><div class="bigstats">' +
     '<div class="bstat"><b>' + nf(week) + '</b><span>this week</span></div>' +
     '<div class="bstat"><b>' + nf(month) + '</b><span>this month</span></div>' +
@@ -754,6 +933,49 @@ function prodHtml(cc) {
     '<div class="card empty">No repository activity yet.</div>';
   return html;
 }
+/* GitHub's "Activity overview" - a four-axis chart of what your contributions
+   were actually made of: commits, pull requests, code review and issues, each
+   plotted as its share of the total. Same numbers as the "This year on GitHub"
+   card below it, drawn the way github.com draws them. */
+function activityRadar(cc) {
+  const cats = [
+    { v: cc.totalCommitContributions, label: 'Commits', color: '#12B76A' },
+    { v: cc.totalPullRequestContributions, label: 'Pull requests', color: '#8B5CF6' },
+    { v: cc.totalPullRequestReviewContributions, label: 'Code review', color: '#F59E0B' },
+    { v: cc.totalIssueContributions, label: 'Issues', color: '#1B6EF3' }
+  ];
+  const vals = cats.map(c => Math.max(0, Number(c.v) || 0));
+  const total = vals.reduce((a, b) => a + b, 0);
+  const pct = vals.map(v => total ? Math.round(100 * v / total) : 0);
+  const W = 320, H = 232, cx = W / 2, cy = H / 2 + 4, R = 72;
+  /* commits to the left, issues right, code review up, pull requests down */
+  const px = [
+    [cx - R * pct[0] / 100, cy],
+    [cx + R * pct[3] / 100, cy],
+    [cx, cy - R * pct[2] / 100],
+    [cx, cy + R * pct[1] / 100]
+  ];
+  let svg = '<svg viewBox="0 0 ' + W + ' ' + H + '" class="radar" role="img" aria-label="Activity overview">';
+  svg += '<line x1="' + cx + '" y1="' + (cy - R) + '" x2="' + cx + '" y2="' + (cy + R) + '" class="radaraxis"/>';
+  svg += '<line x1="' + (cx - R) + '" y1="' + cy + '" x2="' + (cx + R) + '" y2="' + cy + '" class="radaraxis"/>';
+  svg += '<polygon points="' + px.map(p => p[0].toFixed(1) + ',' + p[1].toFixed(1)).join(' ') + '" class="radararea"/>';
+  px.forEach((p, i) => {
+    svg += '<circle cx="' + p[0].toFixed(1) + '" cy="' + p[1].toFixed(1) + '" r="3.4" fill="' + cats[i].color + '"/>';
+  });
+  svg += '<text x="' + (cx - R - 10) + '" y="' + (cy + 4) + '" class="radarlabel end">Commits ' + pct[0] + '%</text>';
+  svg += '<text x="' + (cx + R + 10) + '" y="' + (cy + 4) + '" class="radarlabel">Issues ' + pct[3] + '%</text>';
+  svg += '<text x="' + cx + '" y="' + (cy - R - 10) + '" class="radarlabel mid">Code review ' + pct[2] + '%</text>';
+  svg += '<text x="' + cx + '" y="' + (cy + R + 20) + '" class="radarlabel mid">Pull requests ' + pct[1] + '%</text>';
+  svg += '</svg>';
+  const legend = cats.map((c, i) =>
+    '<div class="lgdrow" style="align-items:center;justify-content:space-between;padding:7px 0">' +
+    '<div class="lgdrow" style="align-items:center"><span class="dot" style="background:' + c.color + '"></span>' +
+    '<span style="margin-left:8px;font-size:13px">' + c.label + '</span></div>' +
+    '<div class="lsub">' + pct[i] + '% · ' + nf(vals[i]) + '</div></div>').join('');
+  return '<h2 class="sect">Activity overview</h2><div class="card">' +
+    (total ? svg + '<div style="margin-top:4px">' + legend + '</div>'
+           : '<div class="empty" style="padding:10px 0">No contributions in the last year yet.</div>') + '</div>';
+}
 async function renderProductivity() {
   const seq = ++RSEQ;
   if (!PDATE) PDATE = todayStr();
@@ -774,6 +996,7 @@ async function renderProductivity() {
     if (!cc) throw new Error('No stats returned');
     LS.set('c.prod', cc);
     paint(cc);
+    widgetPush();
   } catch (e) { if (seq !== RSEQ) return; if (!cached) view().innerHTML = errCard(e); }
   if (PTAB === 'today') loadDay();
 }
@@ -863,7 +1086,7 @@ async function renderHome() {
     '<div class="plogin" data-go="#/user/' + esc(u.login) + '">@' + esc(u.login) + '</div>' +
     (u.bio ? '<p class="pbio">' + esc(u.bio) + '</p>' : '') +
     '<div class="pstats">' +
-    '<div class="pstat" data-go="#/repos"><b>' + nf(u.public_repos) + '</b><span>repos</span></div>' +
+    '<div class="pstat" data-go="#/users/' + esc(u.login) + '/repos"><b>' + nf(u.public_repos) + '</b><span>repos</span></div>' +
     '<div class="pstat" data-go="#/users/' + esc(u.login) + '/followers"><b>' + nf(u.followers) + '</b><span>followers</span></div>' +
     '<div class="pstat" data-go="#/users/' + esc(u.login) + '/following"><b>' + nf(u.following) + '</b><span>following</span></div></div></div>';
   html += '<div class="card quicklinks"><button class="btn ghost" data-go="#/productivity">Productivity</button><button class="btn ghost" data-act="discover">Discover</button><button class="btn ghost" data-go="#/user/' + esc(u.login) + '">My profile</button></div>';
@@ -911,6 +1134,7 @@ async function renderRepos() {
     '<button class="segb' + (RS.mode === 'mine' ? ' on' : '') + '" data-mode="mine">Mine</button>' +
     '<button class="segb' + (RS.mode === 'starred' ? ' on' : '') + '" data-mode="starred">Starred</button>' +
     '<button class="segb' + (RS.mode === 'discover' ? ' on' : '') + '" data-mode="discover">Discover</button></div>' +
+    sortRowHTML('repos') +
     '<div id="repoList">' + spinner() + '</div>' +
     '<button id="repoMore" class="morebtn" hidden>Load more</button>';
   $('#newRepoBtn').addEventListener('click', newRepoSheet);
@@ -919,8 +1143,104 @@ async function renderRepos() {
   $('#repoSearch').addEventListener('keydown', e => { if (e.key === 'Enter') { clearTimeout(t); RS.q = e.target.value.trim(); loadRepos(true); } });
   $$('#repoSeg .segb').forEach(b => b.addEventListener('click', () => { RS.mode = b.dataset.mode; renderRepos(); }));
   $('#repoMore').addEventListener('click', () => { RS.page++; loadRepos(false); });
+  wireSortRow('repos', () => paintRepoList(RS.people));
   loadRepos(true);
 }
+function paintRepoList(people) {
+  const list = $('#repoList'); if (!list) return;
+  let html = '';
+  if (people && people.total_count > 0) {
+    html += '<div class="card" style="padding:0 0 4px"><div class="lsub" style="padding:14px 20px 0">People</div><div class="peoplebar">' +
+      people.items.map(u => '<button class="person" data-go="#/user/' + esc(u.login) + '"><img src="' + esc(u.avatar_url) + '" alt=""><span>' + esc(u.login) + '</span></button>').join('') +
+      '</div></div>';
+  }
+  const sorted = sortItems(RS.items, 'repos');
+  /* the wrapper has no background of its own - it only lets the cards lay out
+     two-up on a laptop, and it keeps the list wrapper-free on phones */
+  if (sorted.length) html += '<div class="repogrid">' + sorted.map(repoRow).join('') + '</div>';
+  else html += '<div class="card empty">' + (RS.q ? 'No results for "' + esc(RS.q) + '"' : (RS.mode === 'discover' ? 'Nothing trending right now.' : 'Nothing here yet.')) + '</div>';
+  list.innerHTML = html;
+}
+/* server-side sort for repo SEARCHES, mapped from the selected sort */
+function searchSortParams() {
+  const s = normSort('repos', LS.get('sort.repos', 'best'));
+  if (s === 'stars') return '&sort=stars&order=desc';
+  if (s === 'sasc') return '&sort=stars&order=asc';
+  if (s === 'forks') return '&sort=forks&order=desc';
+  if (s === 'fasc') return '&sort=forks&order=asc';
+  if (s === 'uasc') return '&sort=updated&order=asc';
+  if (s === 'best') return '';
+  return '&sort=updated&order=desc';
+}
+/* ================= deep + fuzzy repository search =================
+   Three things make a repo "unfindable" with a plain query:
+   1. the request was sent with &sort=updated, which buries a small repo
+      behind thousands of recently pushed ones even for an exact name;
+   2. GitHub's search index lags - a brand new public repo can take a while
+      to appear at all;
+   3. a plain query is matched loosely, so an exact name can rank below
+      unrelated popular repos.
+   So a search now resolves owner/name directly, asks for the exact name,
+   asks broadly, adds the owner's repos when the term looks like a user,
+   and finally ranks everything locally by how well it really matches. */
+function fuzzyScore(r, term) {
+  const t = String(term || '').toLowerCase().trim();
+  if (!t) return 0;
+  const name = String(r.name || '').toLowerCase();
+  const full = String(r.full_name || '').toLowerCase();
+  const owner = full.split('/')[0] || '';
+  let s = 0;
+  if (full === t) s += 160;
+  else if (name === t) s += 120;
+  else if (name.startsWith(t)) s += 80;
+  else if (name.includes(t)) s += 50;
+  if (owner === t) s += 70;
+  else if (owner.includes(t)) s += 18;
+  if (full.includes(t) && name !== t && !name.startsWith(t)) s += 22;
+  if (String(r.description || '').toLowerCase().includes(t)) s += 10;
+  if ((r.topics || []).some(x => String(x).toLowerCase().includes(t))) s += 8;
+  s += Math.min(18, Math.log10((r.stargazers_count || 0) + 1) * 4);
+  return s;
+}
+function rankFuzzy(list, term) {
+  return list.map((r, i) => [r, i]).sort((a, b) => {
+    const d = fuzzyScore(b[0], term) - fuzzyScore(a[0], term);
+    return d !== 0 ? d : a[1] - b[1];
+  }).map(x => x[0]);
+}
+async function deepRepoSearch(term, page, sortParams, wantPeople) {
+  const enc = encodeURIComponent(term);
+  const looksLikePath = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/.test(term);
+  const looksLikeUser = /^[A-Za-z0-9._-]+$/.test(term);
+  const [direct, byName, broad, userRepos, people] = await Promise.all([
+    looksLikePath ? api('/repos/' + term, { status: true }).catch(() => null) : Promise.resolve(null),
+    api('/search/repositories?q=' + enc + '+in%3Aname' + (sortParams || '') + '&per_page=30&page=' + page).catch(() => null),
+    api('/search/repositories?q=' + enc + (sortParams || '') + '&per_page=30&page=' + page).catch(() => null),
+    looksLikeUser ? api('/users/' + enc + '/repos?per_page=30&sort=updated').catch(() => null) : Promise.resolve(null),
+    wantPeople ? api('/search/users?q=' + enc + '&per_page=15').catch(() => null) : Promise.resolve(null)
+  ]);
+  const out = [], seen = new Set();
+  const add = list => (list || []).forEach(r => {
+    const k = r && r.full_name;
+    if (k && !seen.has(k)) { seen.add(k); out.push(r); }
+  });
+  if (direct && direct.status === 200 && direct.data && direct.data.full_name) add([direct.data]);
+  add(byName && byName.items);
+  add(broad && broad.items);
+  add(userRepos);
+  /* nothing at all: retry with the longest word alone, which rescues a name
+     typed with extra words or slightly wrong spacing */
+  if (!out.length && /\s/.test(term)) {
+    const longest = term.split(/\s+/).sort((a, b) => b.length - a.length)[0];
+    if (longest.length >= 3) {
+      const loose = await api('/search/repositories?q=' + encodeURIComponent(longest) + '+in%3Aname&per_page=30').catch(() => null);
+      add(loose && loose.items);
+    }
+  }
+  const explicitSort = !!(sortParams && sortParams.indexOf('sort=') !== -1);
+  return { items: explicitSort ? out : rankFuzzy(out, term), people };
+}
+
 async function loadRepos(reset) {
   const seq = ++RSEQ;
   const list = $('#repoList'); if (!list) return;
@@ -930,24 +1250,34 @@ async function loadRepos(reset) {
     if (cd && Array.isArray(cd) && cd.length) {
       cd.forEach(r => repoCache.set(r.full_name, r));
       RS.items = cd;
-      list.innerHTML = cd.map(repoRow).join('');
+      RS.people = null;
+      paintRepoList(null);
     }
   }
   $('#searchWrap').style.display = '';
   let data = [], people = null;
   try {
     if (RS.mode === 'discover') {
-      const q = RS.q.length >= 2 ? encodeURIComponent(RS.q) : ('stars%3A%3E10000+pushed%3A%3E' + isoDaysAgo(90));
-      const res = await api('/search/repositories?q=' + q + '&sort=stars&order=desc&per_page=30&page=' + RS.page);
-      data = res.items || [];
+      if (RS.q.length >= 2) {
+        const res = await deepRepoSearch(RS.q, RS.page, searchSortParams(), false);
+        data = res.items;
+      } else {
+        const q = 'stars%3A%3E10000+pushed%3A%3E' + isoDaysAgo(90);
+        const res = await api('/search/repositories?q=' + q + searchSortParams() + '&per_page=30&page=' + RS.page);
+        data = res.items || [];
+      }
+    } else if (RS.mode === 'starred' && RS.q.length >= 2) {
+      /* searching the Starred tab must look inside what YOU starred - the old
+         code asked for "user:<you>", which searched your own repositories */
+      const all = await api('/user/starred?per_page=100&page=1').catch(() => []);
+      const t = RS.q.toLowerCase();
+      data = rankFuzzy((all || []).filter(r =>
+        String(r.full_name || '').toLowerCase().includes(t) ||
+        String(r.description || '').toLowerCase().includes(t)), RS.q);
     } else if (RS.q.length >= 2) {
-      const q = RS.q + (RS.mode === 'starred' && USER ? ' user:' + USER.login : '');
-      const both = await Promise.all([
-        api('/search/repositories?q=' + encodeURIComponent(q) + '&sort=updated&per_page=30&page=' + RS.page),
-        api('/search/users?q=' + encodeURIComponent(RS.q) + '&per_page=15').catch(() => null)
-      ]);
-      data = both[0].items || [];
-      people = both[1];
+      const res = await deepRepoSearch(RS.q, RS.page, searchSortParams(), true);
+      data = res.items;
+      people = res.people;
     } else if (RS.mode === 'starred') {
       data = await api('/user/starred?per_page=30&page=' + RS.page);
     } else {
@@ -956,17 +1286,95 @@ async function loadRepos(reset) {
   } catch (e) { if (seq !== RSEQ) return; list.innerHTML = errCard(e); return; }
   data.forEach(r => repoCache.set(r.full_name, r));
   RS.items = reset ? data : RS.items.concat(data);
-  let html = '';
-  if (people && people.total_count > 0) {
-    html += '<div class="card" style="padding:0 0 4px"><div class="lsub" style="padding:14px 20px 0">People</div><div class="peoplebar">' +
-      people.items.map(u => '<button class="person" data-go="#/user/' + esc(u.login) + '"><img src="' + esc(u.avatar_url) + '" alt=""><span>' + esc(u.login) + '</span></button>').join('') +
-      '</div></div>';
-  }
-  if (RS.items.length) html += RS.items.map(repoRow).join('');
-  else html += '<div class="card empty">' + (RS.q ? 'No results for "' + esc(RS.q) + '"' : (RS.mode === 'discover' ? 'Nothing trending right now.' : 'Nothing here yet.')) + '</div>';
+  RS.people = people;
   if (seq !== RSEQ) return;
-  list.innerHTML = html;
+  paintRepoList(people);
   $('#repoMore').hidden = data.length < 30;
+}
+
+/* ================= list sorting (repos, commits, issues) ================= */
+const SORT_OPTIONS = {
+  repos: [['best', 'Best match'], ['stars', 'Most stars'], ['sasc', 'Fewest stars'], ['forks', 'Most forks'], ['fasc', 'Fewest forks'], ['updated', 'Recently updated'], ['uasc', 'Least recently updated'], ['name', 'Name A–Z']],
+  rcommits: [['new', 'Newest'], ['old', 'Oldest'], ['author', 'Author']],
+  hcommits: [['new', 'Newest'], ['old', 'Oldest'], ['repo', 'Repo']],
+  issues: [['updated', 'Recently updated'], ['new', 'Newest'], ['old', 'Oldest'], ['comments', 'Most commented']]
+};
+function sortLabel(kind, key) {
+  const o = (SORT_OPTIONS[kind] || []).find(s => s[0] === key);
+  return o ? o[1] : (SORT_OPTIONS[kind] ? SORT_OPTIONS[kind][0][1] : '');
+}
+/* normalizes sort keys saved by older app versions */
+function normSort(kind, s) {
+  const opts = SORT_OPTIONS[kind];
+  if (opts.some(o => o[0] === s)) return s;
+  if (kind === 'repos' && (s === 'pushed' || s === 'created')) return 'updated';
+  return opts[0][0];
+}
+/* GitHub-style "Sort: …" dropdown button */
+function sortRowHTML(kind) {
+  const cur = normSort(kind, LS.get('sort.' + kind, SORT_OPTIONS[kind][0][0]));
+  return '<button class="btn ghost" data-sort="' + kind + '" style="margin:0 0 12px;width:100%;display:flex;justify-content:space-between;align-items:center">' +
+    '<span class="sortlbl">Sort: ' + sortLabel(kind, cur) + '</span>' +
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="width:18px;height:18px"><polyline points="6 9 12 15 18 9"/></svg></button>';
+}
+function openSortSheet(kind, redo) {
+  const cur = normSort(kind, LS.get('sort.' + kind, SORT_OPTIONS[kind][0][0]));
+  openSheet('<div class="sheethead"><b>Sort by</b><button class="iconbtn" data-act="closesheet">' + SVG.x + '</button></div>' +
+    '<div class="card" style="padding:4px 0">' +
+    SORT_OPTIONS[kind].map(s => '<div class="lrow" data-sel="' + s[0] + '" style="padding:12px 16px">' +
+      '<div class="lmain"><div class="ltitle">' + s[1] + '</div></div>' +
+      (cur === s[0] ? '<div class="istate">' + SVG.check + '</div>' : '') + '</div>').join('') + '</div>');
+  $$('#sheet [data-sel]').forEach(r => r.addEventListener('click', () => {
+    LS.set('sort.' + kind, r.dataset.sel);
+    closeSheet();
+    redo();
+  }));
+}
+function wireSortRow(kind, redo) {
+  const b = document.querySelector('[data-sort="' + kind + '"]');
+  if (!b) return;
+  b.addEventListener('click', () => openSortSheet(kind, redo));
+}
+function commitDate(x) { return (x && x.commit && x.commit.author && x.commit.author.date) || (x && x.date) || ''; }
+function commitAuthor(x) { return (x && x.author && x.author.login) || (x && x.commit && x.commit.author && x.commit.author.name) || ''; }
+function sortItems(items, kind) {
+  const s = normSort(kind, LS.get('sort.' + kind, SORT_OPTIONS[kind][0][0]));
+  const arr = (items || []).slice();
+  const byName = (a, b) => String(a || '').localeCompare(String(b || ''), undefined, { sensitivity: 'base' });
+  if (kind === 'repos') {
+    if (s === 'best') return arr;
+    if (s === 'name') arr.sort((a, b) => byName(a.name, b.name));
+    else if (s === 'stars' || s === 'sasc') { arr.sort((a, b) => (a.stargazers_count || 0) - (b.stargazers_count || 0)); if (s === 'stars') arr.reverse(); }
+    else if (s === 'forks' || s === 'fasc') { arr.sort((a, b) => (a.forks_count || 0) - (b.forks_count || 0)); if (s === 'forks') arr.reverse(); }
+    else if (s === 'updated' || s === 'uasc') { arr.sort((a, b) => new Date(a.pushed_at || a.updated_at || 0) - new Date(b.pushed_at || b.updated_at || 0)); if (s === 'updated') arr.reverse(); }
+  } else if (kind === 'rcommits') {
+    if (s === 'old') arr.sort((a, b) => new Date(commitDate(a) || 0) - new Date(commitDate(b) || 0));
+    else if (s === 'author') arr.sort((a, b) => byName(commitAuthor(a), commitAuthor(b)));
+    else arr.sort((a, b) => new Date(commitDate(b) || 0) - new Date(commitDate(a) || 0));
+  } else if (kind === 'hcommits') {
+    if (s === 'old') arr.sort((a, b) => new Date(a.date || 0) - new Date(b.date || 0));
+    else if (s === 'repo') arr.sort((a, b) => byName(a.repo, b.repo));
+    else arr.sort((a, b) => new Date(b.date || 0) - new Date(a.date || 0));
+  } else if (kind === 'issues') {
+    if (s === 'new') arr.sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0));
+    else if (s === 'old') arr.sort((a, b) => new Date(a.created_at || 0) - new Date(b.created_at || 0));
+    else if (s === 'comments') arr.sort((a, b) => (b.comments || 0) - (a.comments || 0));
+    else arr.sort((a, b) => new Date(b.updated_at || 0) - new Date(a.updated_at || 0));
+  }
+  return arr;
+}
+
+/* true when the signed-in user can push to this repo (owner or collaborator) */
+const PUSH_CACHE = {};
+async function canPushRepo(o, n) {
+  const full = o + '/' + n;
+  if (full in PUSH_CACHE) return PUSH_CACHE[full];
+  let r = repoCache.get(full);
+  if (!r || !r.permissions) {
+    try { r = await api('/repos/' + full); } catch (e) { r = null; }
+  }
+  PUSH_CACHE[full] = !!(r && r.permissions && r.permissions.push);
+  return PUSH_CACHE[full];
 }
 
 /* ================= views: repo detail ================= */
@@ -999,12 +1407,16 @@ async function renderRepo(o, n) {
     '<button class="btn ghost" data-act="ext" data-url="' + esc(r.html_url) + '">' + SVG.ext + '<span>Open</span></button>' +
     '</div></div>';
   if (r.permissions && r.permissions.push) {
-    html += '<div class="card"><button class="btn ghost btnblock" id="editRepoBtn">Edit repository</button></div>';
+    html += '<div class="card" style="display:flex;gap:8px"><button class="btn ghost" id="editRepoBtn" style="flex:1">Edit repository</button><button class="btn ghost" data-go="#/repo/' + full + '/settings" style="flex:1">Settings</button></div>';
   }
-  html += '<div class="seg"><a class="segb on" href="#/repo/' + full + '">Readme</a>' +
+  html += '<div class="seg tabs"><a class="segb on" href="#/repo/' + full + '">Readme</a>' +
     '<a class="segb" href="#/repo/' + full + '/files">Files</a>' +
     '<a class="segb" href="#/repo/' + full + '/commits">Commits</a>' +
-    '<a class="segb" href="#/repo/' + full + '/issues">Issues</a></div>';
+    '<a class="segb" href="#/repo/' + full + '/issues">Issues</a>' +
+    '<a class="segb" href="#/repo/' + full + '/pulls">Pull requests</a>' +
+    '<a class="segb" href="#/repo/' + full + '/actions">Actions</a>' +
+    '<a class="segb" href="#/repo/' + full + '/security">Security</a>' +
+    '<a class="segb" href="#/repo/' + full + '/insights">Insights</a></div>';
   html += '<div id="readmeWrap">' + spinner() + '</div>';
   html += '<div id="langWrap"></div>';
   if (seq !== RSEQ) return;
@@ -1030,6 +1442,9 @@ async function renderRepo(o, n) {
   meta += '<div class="mrow" data-act="clone" data-full="' + esc(full) + '">' + SVG.code +
     '<div class="lmain"><div class="ltitle">Clone</div>' +
     '<div class="lsub">HTTPS / SSH URLs and ZIP download</div></div></div>';
+  meta += '<div class="mrow" data-act="deployments" data-full="' + esc(full) + '">' + SVG.ext +
+    '<div class="lmain"><div class="ltitle">Deployments</div>' +
+    '<div class="lsub">Deployment history and environments</div></div></div>';
   const mr = $('#metaRow'); if (mr) mr.innerHTML = meta;
   // repo actions: star / watch / fork
   const starBtn = $('#actStar'), watchBtn = $('#actWatch'), forkBtn = $('#actFork');
@@ -1093,6 +1508,7 @@ async function renderRepo(o, n) {
 }
 
 function wireFileActions(o, n, path) {
+  if (!$('#addFileBtn')) return;
   $('#addFileBtn').addEventListener('click', () => addFileSheet(o, n, path));
   const upi = $('#upInput');
   $('#upFileBtn').addEventListener('click', () => {
@@ -1140,12 +1556,16 @@ async function renderFiles(o, n, path) {
   const full = o + '/' + n;
   if (seq !== RSEQ) return;
   view().innerHTML = spinner();
+  const canWrite = await canPushRepo(o, n);
+  if (seq !== RSEQ) return;
+  /* file write actions only for repos you can push to */
+  const actRow = canWrite ? '<div style="display:flex;gap:8px;margin-bottom:12px"><button class="btn ghost" id="addFileBtn" style="flex:1">Add file</button><button class="btn ghost" id="upFileBtn" style="flex:1">Upload files</button><button class="btn ghost" id="upDirBtn" style="flex:1">Upload folder</button></div>' : '';
   let items;
   try { items = await api('/repos/' + full + '/contents/' + (path ? encodeURIComponent(path).replace(/%2F/g, '/') : '')); }
   catch (e) {
     if (seq !== RSEQ) return;
     if (/is empty/i.test(e.message || '')) {
-      view().innerHTML = '<div style="display:flex;gap:8px;margin-bottom:12px"><button class="btn ghost" id="addFileBtn" style="flex:1">Add file</button><button class="btn ghost" id="upFileBtn" style="flex:1">Upload files</button><button class="btn ghost" id="upDirBtn" style="flex:1">Upload folder</button></div><input type="file" id="upInput" multiple hidden><div class="card empty">This repository is empty \u2014 add your first file to get started.</div>';
+      view().innerHTML = actRow + '<input type="file" id="upInput" multiple hidden><div class="card empty">This repository is empty \u2014 add your first file to get started.</div>';
       wireFileActions(o, n, path);
       return;
     }
@@ -1154,7 +1574,7 @@ async function renderFiles(o, n, path) {
   if (!Array.isArray(items)) { view().innerHTML = '<div class="card empty">Not a folder.</div>'; return; }
   items.sort((a, b) => (a.type === b.type ? a.name.localeCompare(b.name) : (a.type === 'dir' ? -1 : 1)));
   let html = path ? '<div class="card crumb">/' + esc(path) + '</div>' : '';
-  html += '<div style="display:flex;gap:8px;margin-bottom:12px"><button class="btn ghost" id="addFileBtn" style="flex:1">Add file</button><button class="btn ghost" id="upFileBtn" style="flex:1">Upload files</button><button class="btn ghost" id="upDirBtn" style="flex:1">Upload folder</button></div>';
+  html += actRow;
   html += '<input type="file" id="upInput" multiple hidden>';
   html += '<div class="card list">';
   if (path) {
@@ -1163,7 +1583,9 @@ async function renderFiles(o, n, path) {
   }
   items.forEach(it => {
     if (it.type === 'dir') html += '<div class="lrow" data-go="#/repo/' + full + '/files/' + it.path + '">' + SVG.folder + '<div class="lmain"><div class="ltitle">' + esc(it.name) + '</div></div></div>';
-    else html += '<div class="lrow" data-act="openfile" data-repo="' + esc(full) + '" data-file="' + esc(it.path) + '">' + SVG.file + '<div class="lmain"><div class="ltitle">' + esc(it.name) + '</div><div class="lsub">' + fmtSize(it.size) + '</div></div></div>';
+    else html += '<div class="lrow" data-act="openfile" data-repo="' + esc(full) + '" data-file="' + esc(it.path) + '">' + SVG.file + '<div class="lmain"><div class="ltitle">' + esc(it.name) + '</div><div class="lsub">' + fmtSize(it.size) + '</div></div>' +
+      /* download straight from the list, without opening the file first */
+      '<button class="iconbtn" data-act="apidl" data-owner="' + esc(o) + '" data-repo="' + esc(n) + '" data-path="' + esc(it.path) + '" data-name="' + esc(it.name) + '" aria-label="download ' + esc(it.name) + '">' + SVG.dl + '</button></div>';
   });
   html += '</div>';
   if (seq !== RSEQ) return;
@@ -1208,8 +1630,11 @@ async function renderCommits(o, n) {
   if (total !== null || today !== null) html += '<div class="card commitstats" style="margin:0 0 14px">' +
     (total !== null ? '<div class="cstat total">' + nf(total) + '<span>Total commits</span></div>' : '') +
     (today !== null ? '<div class="cstat today">' + nf(today) + '<span>Today</span></div>' : '') + '</div>';
-  html += items.length ? '<div class="card list">' + items.map(x => commitRow(x, full)).join('') + '</div>' : '<div class="card empty">No commits found.</div>';
+  html += sortRowHTML('rcommits');
+  const sorted = sortItems(items, 'rcommits');
+  html += sorted.length ? '<div class="card list">' + sorted.map(x => commitRow(x, full)).join('') + '</div>' : '<div class="card empty">No commits found.</div>';
   view().innerHTML = html;
+  wireSortRow('rcommits', () => renderCommits(o, n));
   wireCommitRows();
 }
 /* counts results of a LIST endpoint exactly via the Link header (per_page=1 trick) */
@@ -1235,10 +1660,14 @@ function commitTabRow(x) {
 async function renderCommitsHome() {
   const seq = ++RSEQ;
   const cached = LS.get('c.allcomm', null);
+  let lastShown = cached && cached.length ? cached : [];
   const paint = items => {
+    lastShown = items || [];
     if (seq !== RSEQ) return;
-    view().innerHTML = items.length ? '<div class="card list">' + items.map(commitTabRow).join('') + '</div>' : '<div class="card empty">No commits found yet.</div>';
+    view().innerHTML = sortRowHTML('hcommits') +
+      (lastShown.length ? '<div class="card list">' + sortItems(lastShown, 'hcommits').map(commitTabRow).join('') + '</div>' : '<div class="card empty">No commits found yet.</div>');
     wireCommitRows();
+    wireSortRow('hcommits', () => paint(lastShown));
   };
   if (cached && cached.length) paint(cached); else view().innerHTML = spinner();
   const query = 'query{viewer{repositories(first:100,orderBy:{field:PUSHED_AT,direction:DESC},affiliations:OWNER,isFork:false){nodes{nameWithOwner defaultBranchRef{target{... on Commit{history(first:10){edges{node{oid messageHeadline committedDate author{name user{login avatarUrl(size:60)}}}}}}}}}}}}';
@@ -1510,11 +1939,13 @@ async function renderReleases(o, n) {
   const full = o + '/' + n;
   if (seq !== RSEQ) return;
   view().innerHTML = spinner();
+  const canWrite = await canPushRepo(o, n);
+  if (seq !== RSEQ) return;
   let items;
   try { items = await api('/repos/' + full + '/releases?per_page=30'); }
   catch (e) { if (seq !== RSEQ) return; view().innerHTML = errCard(e); return; }
-  if (!items.length) { view().innerHTML = '<button class="btn ghost btnblock" id="newRelBtn" style="margin-bottom:12px">New release</button><div class="card empty">No releases published yet.<br><span class="dim">Create one above — tag a version, describe it, done.</span></div><input type="file" id="relUpInput" hidden>'; $('#newRelBtn').addEventListener('click', () => newReleaseSheet(o, n)); return; }
-  let html = '<button class="btn ghost btnblock" id="newRelBtn" style="margin-bottom:12px">New release</button><input type="file" id="relUpInput" hidden>';
+  if (!items.length) { view().innerHTML = (canWrite ? '<button class="btn ghost btnblock" id="newRelBtn" style="margin-bottom:12px">New release</button>' : '') + '<div class="card empty">No releases published yet.' + (canWrite ? '<br><span class="dim">Create one above — tag a version, describe it, done.</span>' : '') + '</div><input type="file" id="relUpInput" hidden>'; if (canWrite) $('#newRelBtn').addEventListener('click', () => newReleaseSheet(o, n)); return; }
+  let html = (canWrite ? '<button class="btn ghost btnblock" id="newRelBtn" style="margin-bottom:12px">New release</button>' : '') + '<input type="file" id="relUpInput" hidden>';
   items.forEach(rl => {
     html += '<div class="card">' +
       '<div class="rcrow"><div class="rcname">' + esc(rl.name || rl.tag_name) + '</div>' +
@@ -1530,7 +1961,7 @@ async function renderReleases(o, n) {
         html += '<div class="lrow" data-act="download" data-url="' + esc(a.browser_download_url) + '" data-name="' + esc(a.name) + '">' + SVG.dl +
           '<div class="lmain"><div class="ltitle">' + esc(a.name) + '</div>' +
           '<div class="lsub">' + fmtSize(a.size) + ' · ' + nf(a.download_count) + ' downloads</div></div>' +
-          '<button class="iconbtn" data-act="delasset" data-full="' + esc(full) + '" data-aid="' + a.id + '" data-aname="' + esc(a.name) + '" aria-label="delete file">' + SVG.x + '</button></div>';
+          (canWrite ? '<button class="iconbtn" data-act="delasset" data-full="' + esc(full) + '" data-aid="' + a.id + '" data-aname="' + esc(a.name) + '" aria-label="delete file">' + SVG.x + '</button>' : '') + '</div>';
       });
       html += '</div>';
     }
@@ -1541,8 +1972,8 @@ async function renderReleases(o, n) {
       '<div class="lrow" data-act="download" data-url="https://github.com/' + full + '/archive/refs/tags/' + esc(rl.tag_name) + '.tar.gz" data-name="' + esc(n + '-' + rl.tag_name + '.tar.gz') + '">' + SVG.dl +
       '<div class="lmain"><div class="ltitle">Source code (tar.gz)</div><div class="lsub">complete snapshot of ' + esc(rl.tag_name) + '</div></div></div>' +
       '</div>' +
-      '<div style="display:flex;gap:8px;margin-top:12px"><button class="btn sm ghost" data-act="relup" data-relup="' + rl.id + '" data-full="' + esc(full) + '" style="flex:1">Upload files</button>' +
-      '<button class="btn sm ghost" data-rel="' + rl.id + '" style="flex:1">Edit release</button></div></div>';
+      (canWrite ? '<div style="display:flex;gap:8px;margin-top:12px"><button class="btn sm ghost" data-act="relup" data-relup="' + rl.id + '" data-full="' + esc(full) + '" style="flex:1">Upload files</button>' +
+      '<button class="btn sm ghost" data-rel="' + rl.id + '" style="flex:1">Edit release</button></div></div>' : '</div>');
   });
   if (seq !== RSEQ) return;
   view().innerHTML = html;
@@ -1550,7 +1981,8 @@ async function renderReleases(o, n) {
     const rl = items.find(x => String(x.id) === b.dataset.rel);
     if (rl) editReleaseSheet(o, n, rl);
   }));
-  $('#newRelBtn').addEventListener('click', () => newReleaseSheet(o, n));
+  const nb = $('#newRelBtn');
+  if (nb) nb.addEventListener('click', () => newReleaseSheet(o, n));
   $('#relUpInput').addEventListener('change', async e => {
     const f = e.target.files && e.target.files[0];
     const rid = window._relTarget;
@@ -1588,8 +2020,245 @@ async function renderRepoIssues(o, n) {
     return;
   }
   if (seq !== RSEQ) return;
-  view().innerHTML = newBtn + '<div class="card list">' + items.map(issueRow).join('') + '</div>';
+  view().innerHTML = newBtn + sortRowHTML('issues') + '<div class="card list">' + sortItems(items, 'issues').map(issueRow).join('') + '</div>';
   $('#newIssueBtn').addEventListener('click', () => newIssueSheet(o, n));
+  wireSortRow('issues', () => renderRepoIssues(o, n));
+}
+
+/* ================= repo settings (full GitHub-style screen) ================= */
+function tgRow(title, sub, key, on) {
+  return '<div class="setrow" style="margin-top:14px"><div class="lmain"><div class="ltitle">' + title + '</div>' + (sub ? '<div class="lsub">' + sub + '</div>' : '') + '</div><button class="switch' + (on ? ' on' : '') + '" data-tg="' + key + '"></button></div>';
+}
+async function renderRepoSettings(o, n) {
+  const seq = ++RSEQ;
+  const full = o + '/' + n;
+  view().innerHTML = spinner();
+  const canWrite = await canPushRepo(o, n);
+  if (seq !== RSEQ) return;
+  if (!canWrite) { view().innerHTML = '<div class="card empty">You do not have permission to change this repository\u2019s settings.</div>'; return; }
+  let r;
+  try { r = await api('/repos/' + full); } catch (e) { if (seq === RSEQ) view().innerHTML = errCard(e); return; }
+  if (seq !== RSEQ) return;
+  const branches = await api('/repos/' + full + '/branches?per_page=100').catch(() => []);
+  if (seq !== RSEQ) return;
+  let html = '';
+  html += '<div class="card"><div class="ltitle" style="padding:2px 4px 12px;font-size:15px">General</div>' +
+    '<label class="fldlabel">Repository name</label><input class="fld" id="rsName" value="' + esc(r.name || '') + '" autocomplete="off" spellcheck="false">' +
+    '<label class="fldlabel" style="margin-top:12px">Description</label><input class="fld" id="rsDesc" value="' + esc(r.description || '') + '" autocomplete="off">' +
+    '<label class="fldlabel" style="margin-top:12px">Homepage</label><input class="fld" id="rsHome" value="' + esc(r.homepage || '') + '" placeholder="https://…" autocomplete="off">' +
+    '<label class="fldlabel" style="margin-top:12px">Default branch</label><select class="fld" id="rsBranch">' +
+    ((branches || []).map(b => '<option value="' + esc(b.name) + '"' + (b.name === r.default_branch ? ' selected' : '') + '>' + esc(b.name) + '</option>').join('') || '<option value="' + esc(r.default_branch || 'main') + '">' + esc(r.default_branch || 'main') + '</option>') +
+    '</select><button class="btn primary btnblock" id="rsSave" style="margin-top:16px">Save changes</button></div>';
+  html += '<div class="card"><div class="ltitle" style="padding:2px 4px 4px;font-size:15px">Features</div>' +
+    tgRow('Issues', 'Issue tracker for this repo', 'has_issues', r.has_issues) +
+    tgRow('Wiki', 'Editable wiki pages', 'has_wiki', r.has_wiki) +
+    tgRow('Projects', 'Repo projects and task boards', 'has_projects', r.has_projects) +
+    tgRow('Discussions', 'Community discussion forum', 'has_discussions', r.has_discussions) +
+    tgRow('Template repository', 'Others can generate new repos from it', 'is_template', r.is_template) +
+    tgRow('Private repository', 'Only you and collaborators can see it', 'private', r.private) + '</div>';
+  html += '<div class="card"><div class="ltitle" style="padding:2px 4px 4px;font-size:15px">Pull requests</div>' +
+    tgRow('Allow merge commits', 'Merge with a merge commit', 'allow_merge_commit', r.allow_merge_commit) +
+    tgRow('Allow squash merging', 'Squash all commits into one', 'allow_squash_merge', r.allow_squash_merge) +
+    tgRow('Allow rebase merging', 'Rebase and fast-forward', 'allow_rebase_merge', r.allow_rebase_merge) +
+    tgRow('Allow auto-merge', 'Merge automatically when checks pass', 'allow_auto_merge', r.allow_auto_merge) +
+    tgRow('Auto-delete head branches', 'Delete branches after merging', 'delete_branch_on_merge', r.delete_branch_on_merge) +
+    tgRow('Allow forking', 'Let others fork this private repo', 'allow_forking', r.allow_forking) + '</div>';
+  html += '<div class="card"><div class="rcrow"><div class="rcname">Collaborators</div><button class="btn sm ghost" id="rsAddCollab">Add</button></div><div id="rsCollabList">' + spinner(true) + '</div></div>';
+  html += '<div class="card"><div class="rcrow"><div class="rcname">Branches</div></div><div id="rsBranchList">' + spinner(true) + '</div></div>';
+  html += '<div class="card"><div class="rcrow"><div class="rcname">Tags</div></div><div id="rsTagList">' + spinner(true) + '</div></div>';
+  html += '<div class="card"><div class="rcrow"><div class="rcname">Webhooks</div><button class="btn sm ghost" id="rsAddHook">Add</button></div><div id="rsHookList">' + spinner(true) + '</div></div>';
+  html += '<div class="card"><div class="rcrow"><div class="rcname">Deploy keys</div><button class="btn sm ghost" id="rsAddKey">Add</button></div><div id="rsKeyList">' + spinner(true) + '</div></div>';
+  html += '<div class="card" id="pagesCard">' + spinner(true) + '</div>';
+  html += '<div class="card"><div class="rcrow"><div class="rcname">Environments</div><button class="btn sm ghost" id="rsAddEnv">New</button></div><div id="rsEnvList">' + spinner(true) + '</div></div>';
+  html += '<div class="card" id="ilCard">' + spinner(true) + '</div>';
+  html += '<div class="card"><div class="rcrow"><div class="rcname">Branch protection</div></div><div class="lsub" style="margin-top:4px">Require reviews, status checks or admin enforcement before merging into a branch.</div><label class="fldlabel" style="margin-top:12px">Branch</label><select class="fld" id="bpBranch"></select><button class="btn ghost btnblock" id="bpEdit" style="margin-top:14px">Protection rules</button></div>';
+  html += '<div class="card"><div class="ltitle" style="padding:2px 4px 4px;font-size:15px">Danger zone</div>' +
+    tgRow('Archived', 'Makes the repository read-only for everyone', 'archived', r.archived) +
+    '<div style="display:flex;gap:8px;margin-top:16px"><button class="btn danger" id="rsVisibility" style="flex:1">Change visibility</button><button class="btn danger" id="rsTransfer" style="flex:1">Transfer</button></div>' +
+    '<button class="btn danger btnblock" id="rsDelete" style="margin-top:8px">Delete repository</button></div>';
+  view().innerHTML = html;
+  $('#rsSave').addEventListener('click', async () => {
+    const newName = $('#rsName').value.trim();
+    if (!newName) { toast('Repository name cannot be empty'); return; }
+    if (!/^[A-Za-z0-9._-]+$/.test(newName)) { toast('Name can only use letters, numbers, . _ and -'); return; }
+    if (newName.length > 100) { toast('Name is too long (max 100 characters)'); return; }
+    const btn = $('#rsSave'); btn.disabled = true;
+    try {
+      const upd = await api('/repos/' + full, { method: 'PATCH', body: JSON.stringify({ name: newName, description: $('#rsDesc').value.trim(), homepage: $('#rsHome').value.trim() }) });
+      const finalName = (upd && upd.name) ? upd.name : newName;
+      if (finalName !== n) { toast('Renamed to ' + finalName); location.hash = '#/repo/' + o + '/' + finalName + '/settings'; }
+      else { toast('Saved'); btn.disabled = false; }
+    } catch (e) { toast('Failed: ' + e.message); btn.disabled = false; }
+  });
+  $('#rsBranch').addEventListener('change', async e => {
+    try { await api('/repos/' + full, { method: 'PATCH', body: JSON.stringify({ default_branch: e.target.value }) }); r.default_branch = e.target.value; toast('Default branch set to ' + e.target.value); loadBranches(); }
+    catch (er) { toast('Failed: ' + er.message); }
+  });
+  view().querySelectorAll('[data-tg]').forEach(sw => sw.addEventListener('click', async () => {
+    const key = sw.dataset.tg;
+    const val = !sw.classList.contains('on');
+    try {
+      if (key === 'archived') await api('/repos/' + full + (val ? '/archive' : '/unarchive'), { method: 'PUT' });
+      else await api('/repos/' + full, { method: 'PATCH', body: JSON.stringify({ [key]: val }) });
+      sw.classList.toggle('on', val);
+      toast('Saved');
+    } catch (e) { toast('Failed: ' + e.message); }
+  }));
+  $('#rsDelete').addEventListener('click', () => deleteRepoSheet(o, n));
+  const rsVis = $('#rsVisibility');
+  if (rsVis) rsVis.addEventListener('click', () => {
+    const makePrivate = !r.private;
+    if (!window.confirm(makePrivate ? 'Make this repository private? Only you and collaborators will see it.' : 'Make this repository public? Anyone on the internet can see it.')) return;
+    api('/repos/' + full, { method: 'PATCH', body: JSON.stringify({ private: makePrivate }) }).then(() => { toast('Repository is now ' + (makePrivate ? 'private' : 'public')); r.private = makePrivate; })
+      .catch(e => toast('Failed: ' + e.message));
+  });
+  const rsTr = $('#rsTransfer');
+  if (rsTr) rsTr.addEventListener('click', () => transferSheet(o, n));
+  loadPages(o, n);
+  loadEnvs(o, n);
+  loadIL(o, n);
+  const bpSel = $('#bpBranch');
+  if (bpSel) {
+    bpSel.innerHTML = (branches || []).map(b => '<option value="' + esc(b.name) + '"' + (b.name === r.default_branch ? ' selected' : '') + '>' + esc(b.name) + '</option>').join('');
+    const bpe = $('#bpEdit');
+    if (bpe) bpe.addEventListener('click', () => { if (bpSel.value) protectionSheet(o, n, bpSel.value); });
+  }
+  const aenv = $('#rsAddEnv');
+  if (aenv) aenv.addEventListener('click', async () => {
+    const name = window.prompt('Environment name (e.g. production, github-pages)');
+    if (!name) return;
+    try { await api('/repos/' + full + '/environments/' + encodeURIComponent(name.trim()), { method: 'PUT', body: JSON.stringify({}) }); toast('Environment created'); loadEnvs(o, n); }
+    catch (e) { toast('Failed: ' + e.message); }
+  });
+  const loadCollab = async () => {
+    const el = $('#rsCollabList'); if (!el) return;
+    try {
+      const cols = await api('/repos/' + full + '/collaborators?affiliation=direct');
+      el.innerHTML = cols.length ? cols.map(c => '<div class="lrow" style="padding:10px 0">' +
+        '<img class="cav" src="' + esc(c.avatar_url) + '" alt=""><div class="lmain"><div class="ltitle">' + esc(c.login) + '</div><div class="lsub">' +
+        (c.permissions && c.permissions.admin ? 'admin' : (c.permissions && c.permissions.push ? 'write' : 'read')) + (USER && c.login === USER.login ? ' · you' : '') + '</div></div>' +
+        (USER && c.login !== USER.login ? '<button class="iconbtn" data-rmcol="' + esc(c.login) + '" aria-label="remove">' + SVG.x + '</button>' : '') + '</div>').join('') :
+        '<div class="lsub" style="padding:10px 0">No collaborators yet — add one above.</div>';
+      el.querySelectorAll('[data-rmcol]').forEach(b => b.addEventListener('click', async () => {
+        if (!window.confirm('Remove ' + b.dataset.rmcol + ' from this repository?')) return;
+        try { await api('/repos/' + full + '/collaborators/' + b.dataset.rmcol, { method: 'DELETE' }); toast('Removed ' + b.dataset.rmcol); loadCollab(); }
+        catch (e) { toast('Failed: ' + e.message); }
+      }));
+    } catch (e) { el.innerHTML = '<div class="lsub" style="padding:10px 0">' + esc(e.message) + '</div>'; }
+  };
+  const loadBranches = async () => {
+    const el = $('#rsBranchList'); if (!el) return;
+    try {
+      const bs = await api('/repos/' + full + '/branches?per_page=100');
+      el.innerHTML = bs.length ? bs.map(b => '<div class="lrow" style="padding:10px 0">' + SVG.folder +
+        '<div class="lmain"><div class="ltitle">' + esc(b.name) + (b.name === r.default_branch ? ' <span class="chip">default</span>' : '') + '</div></div>' +
+        (b.name !== r.default_branch ? '<button class="btn sm ghost" data-setdef="' + esc(b.name) + '" style="margin-right:6px">Make default</button><button class="iconbtn" data-rmbr="' + esc(b.name) + '" aria-label="delete">' + SVG.x + '</button>' : '') + '</div>').join('') :
+        '<div class="lsub" style="padding:10px 0">No branches.</div>';
+      el.querySelectorAll('[data-setdef]').forEach(b => b.addEventListener('click', async () => {
+        try { await api('/repos/' + full, { method: 'PATCH', body: JSON.stringify({ default_branch: b.dataset.setdef }) }); r.default_branch = b.dataset.setdef; $('#rsBranch').value = b.dataset.setdef; toast('Default branch set to ' + b.dataset.setdef); loadBranches(); }
+        catch (e) { toast('Failed: ' + e.message); }
+      }));
+      el.querySelectorAll('[data-rmbr]').forEach(b => b.addEventListener('click', async () => {
+        if (!window.confirm('Delete branch ' + b.dataset.rmbr + '?')) return;
+        try { await api('/repos/' + full + '/git/refs/heads/' + b.dataset.rmbr, { method: 'DELETE' }); toast('Branch deleted'); loadBranches(); }
+        catch (e) { toast('Failed: ' + e.message); }
+      }));
+    } catch (e) { el.innerHTML = '<div class="lsub" style="padding:10px 0">' + esc(e.message) + '</div>'; }
+  };
+  const loadTags = async () => {
+    const el = $('#rsTagList'); if (!el) return;
+    try {
+      const ts = await api('/repos/' + full + '/tags?per_page=100');
+      el.innerHTML = ts.length ? ts.map(t => '<div class="lrow" style="padding:10px 0"><div class="lmain"><div class="ltitle">' + esc(t.name) + '</div><div class="lsub">' + esc((t.commit && t.commit.sha || '').slice(0, 7)) + '</div></div>' +
+        '<button class="iconbtn" data-rmtag="' + esc(t.name) + '" aria-label="delete">' + SVG.x + '</button></div>').join('') :
+        '<div class="lsub" style="padding:10px 0">No tags yet.</div>';
+      el.querySelectorAll('[data-rmtag]').forEach(b => b.addEventListener('click', async () => {
+        if (!window.confirm('Delete tag ' + b.dataset.rmtag + '? This can break releases that point to it.')) return;
+        try { await api('/repos/' + full + '/git/refs/tags/' + b.dataset.rmtag, { method: 'DELETE' }); toast('Tag deleted'); loadTags(); }
+        catch (e) { toast('Failed: ' + e.message); }
+      }));
+    } catch (e) { el.innerHTML = '<div class="lsub" style="padding:10px 0">' + esc(e.message) + '</div>'; }
+  };
+  const loadHooks = async () => {
+    const el = $('#rsHookList'); if (!el) return;
+    try {
+      const hs = await api('/repos/' + full + '/hooks');
+      el.innerHTML = hs.length ? hs.map(h => '<div class="lrow" style="padding:10px 0"><div class="lmain"><div class="ltitle" style="word-break:break-all">' + esc((h.config && h.config.url) || 'webhook') + '</div><div class="lsub">' +
+        ((h.events || []).join(', ') || 'no events') + (h.active === false ? ' · paused' : '') + '</div></div>' +
+        '<button class="iconbtn" data-rmhook="' + h.id + '" aria-label="delete">' + SVG.x + '</button></div>').join('') :
+        '<div class="lsub" style="padding:10px 0">No webhooks configured.</div>';
+      el.querySelectorAll('[data-rmhook]').forEach(b => b.addEventListener('click', async () => {
+        if (!window.confirm('Delete this webhook?')) return;
+        try { await api('/repos/' + full + '/hooks/' + b.dataset.rmhook, { method: 'DELETE' }); toast('Webhook deleted'); loadHooks(); }
+        catch (e) { toast('Failed: ' + e.message); }
+      }));
+    } catch (e) { el.innerHTML = '<div class="lsub" style="padding:10px 0">' + esc(e.message) + '</div>'; }
+  };
+  const loadKeys = async () => {
+    const el = $('#rsKeyList'); if (!el) return;
+    try {
+      const ks = await api('/repos/' + full + '/keys');
+      el.innerHTML = ks.length ? ks.map(k => '<div class="lrow" style="padding:10px 0"><div class="lmain"><div class="ltitle">' + esc(k.title) + (k.read_only ? ' <span class="chip">read-only</span>' : '') + '</div><div class="lsub">' + esc((k.fingerprint || '').replace(/^SHA256:/, '')) + '</div></div>' +
+        '<button class="iconbtn" data-rmkey="' + k.id + '" aria-label="delete">' + SVG.x + '</button></div>').join('') :
+        '<div class="lsub" style="padding:10px 0">No deploy keys.</div>';
+      el.querySelectorAll('[data-rmkey]').forEach(b => b.addEventListener('click', async () => {
+        if (!window.confirm('Delete this deploy key?')) return;
+        try { await api('/repos/' + full + '/keys/' + b.dataset.rmkey, { method: 'DELETE' }); toast('Key deleted'); loadKeys(); }
+        catch (e) { toast('Failed: ' + e.message); }
+      }));
+    } catch (e) { el.innerHTML = '<div class="lsub" style="padding:10px 0">' + esc(e.message) + '</div>'; }
+  };
+  $('#rsAddCollab').addEventListener('click', () => addCollabSheet(full, loadCollab));
+  $('#rsAddHook').addEventListener('click', () => addWebhookSheet(full, loadHooks));
+  $('#rsAddKey').addEventListener('click', () => addDeployKeySheet(full, loadKeys));
+  loadCollab(); loadBranches(); loadTags(); loadHooks(); loadKeys();
+}
+function addCollabSheet(full, after) {
+  openSheet('<div class="sheethead"><b>Add collaborator</b><button class="iconbtn" data-act="closesheet">' + SVG.x + '</button></div>' +
+    '<label class="fldlabel">GitHub username</label><input class="fld" id="acUser" placeholder="username" autocomplete="off">' +
+    '<button class="btn primary btnblock" id="acGo" style="margin-top:16px">Add</button>');
+  $('#acGo').addEventListener('click', async () => {
+    const u = $('#acUser').value.trim();
+    if (!u) { toast('Enter a username'); return; }
+    try {
+      await api('/repos/' + full + '/collaborators/' + u, { method: 'PUT', body: JSON.stringify({ permission: 'write' }) });
+      closeSheet(); toast('Added ' + u + ' as a collaborator'); after && after();
+    } catch (e) { toast('Failed: ' + e.message); }
+  });
+}
+function addWebhookSheet(full, after) {
+  openSheet('<div class="sheethead"><b>Add webhook</b><button class="iconbtn" data-act="closesheet">' + SVG.x + '</button></div>' +
+    '<label class="fldlabel">Payload URL</label><input class="fld" id="whUrl" placeholder="https://example.com/hook" autocomplete="off">' +
+    '<div class="seg sm" style="margin-top:14px"><button class="segb on" id="whEvPush">Push events</button><button class="segb" id="whEvAll">Everything</button></div>' +
+    '<div class="lsub" style="margin-top:10px">GitHub will POST repo activity to this URL.</div>' +
+    '<button class="btn primary btnblock" id="whGo" style="margin-top:16px">Add webhook</button>');
+  let all = false;
+  $('#whEvPush').addEventListener('click', () => { all = false; $('#whEvPush').classList.add('on'); $('#whEvAll').classList.remove('on'); });
+  $('#whEvAll').addEventListener('click', () => { all = true; $('#whEvAll').classList.add('on'); $('#whEvPush').classList.remove('on'); });
+  $('#whGo').addEventListener('click', async () => {
+    const url = $('#whUrl').value.trim();
+    if (!/^https?:\/\//.test(url)) { toast('Enter a valid https:// URL'); return; }
+    try {
+      await api('/repos/' + full + '/hooks', { method: 'POST', body: JSON.stringify({ name: 'web', active: true, events: all ? ['*'] : ['push'], config: { url: url, content_type: 'json' } }) });
+      closeSheet(); toast('Webhook added'); after && after();
+    } catch (e) { toast('Failed: ' + e.message); }
+  });
+}
+function addDeployKeySheet(full, after) {
+  openSheet('<div class="sheethead"><b>Add deploy key</b><button class="iconbtn" data-act="closesheet">' + SVG.x + '</button></div>' +
+    '<label class="fldlabel">Title</label><input class="fld" id="dkTitle" autocomplete="off">' +
+    '<label class="fldlabel" style="margin-top:12px">Key</label><textarea class="replyta" id="dkKey" placeholder="ssh-ed25519 AAAA…" spellcheck="false"></textarea>' +
+    '<div class="setrow" style="margin-top:14px"><div class="lmain"><div class="ltitle">Read-only access</div><div class="lsub">This key can pull but not push</div></div><button class="switch on" id="dkRo"></button></div>' +
+    '<button class="btn primary btnblock" id="dkGo" style="margin-top:16px">Add key</button>');
+  $('#dkRo').addEventListener('click', () => $('#dkRo').classList.toggle('on'));
+  $('#dkGo').addEventListener('click', async () => {
+    const title = $('#dkTitle').value.trim(), key = $('#dkKey').value.trim();
+    if (!title || !key) { toast('Title and key are both required'); return; }
+    try {
+      await api('/repos/' + full + '/keys', { method: 'POST', body: JSON.stringify({ title: title, key: key, read_only: $('#dkRo').classList.contains('on') }) });
+      closeSheet(); toast('Deploy key added'); after && after();
+    } catch (e) { toast('Failed: ' + e.message); }
+  });
 }
 
 function repoPickerSheet(cb) {
@@ -2152,14 +2821,21 @@ async function renderIssue(o, n, num) {
     comments = await api('/repos/' + o + '/' + n + '/issues/' + num + '/comments?per_page=50', { accept: 'application/vnd.github.html+json' });
   } catch (e) { if (seq !== RSEQ) return; view().innerHTML = errCard(e); return; }
   const isPR = !!iss.pull_request;
+  let pr = null;
+  if (isPR) pr = await api('/repos/' + o + '/' + n + '/pulls/' + num).catch(() => null);
   let html = '<div class="card issuehead"><div class="chips">' +
     '<span class="chip ' + (iss.state === 'open' ? 'ok' : 'closed') + '">' + (iss.state === 'open' ? 'Open' : 'Closed') + '</span>' +
-    (isPR ? '<span class="chip pr">Pull Request</span>' : '') + '</div>' +
+    (isPR ? '<span class="chip pr">Pull Request</span>' : '') +
+    (pr && pr.draft ? '<span class="chip">Draft</span>' : '') +
+    (pr && pr.merged_at ? '<span class="chip ok">Merged</span>' : '') + '</div>' +
     '<div class="ihtitle">' + esc(iss.title) + '</div>' +
     '<div class="ihmeta">' + esc(iss.user.login) + ' opened ' + tAgo(iss.created_at) +
     (isPR && iss.pull_request.merged_at ? ' · merged' : '') + '</div>' +
+    (pr ? '<div class="ihmeta" style="margin-top:4px">' + esc(pr.head.ref) + ' → ' + esc(pr.base.ref) +
+      (pr.additions !== undefined ? ' · <span style="color:#12B76A">+' + nf(pr.additions) + '</span> <span style="color:#EF4444">−' + nf(pr.deletions) + '</span> · ' + nf(pr.changed_files) + ' files' : '') + '</div>' : '') +
     '<button class="btn ' + (iss.state === 'open' ? 'ghost' : 'primary') + '" id="stateBtn" style="margin-top:14px">' +
-    (iss.state === 'open' ? (isPR ? 'Close pull request' : 'Close issue') : (isPR ? 'Reopen pull request' : 'Reopen issue')) + '</button></div>';
+    (iss.state === 'open' ? (isPR ? 'Close pull request' : 'Close issue') : (isPR ? 'Reopen pull request' : 'Reopen issue')) + '</button>' +
+    (pr && iss.state === 'open' && !pr.merged_at ? '<button class="btn primary" id="mergeBtn" style="margin-top:10px">Merge pull request</button>' : '') + '</div>';
   html += '<div class="card md">' + (iss.body_html ? fixMd(iss.body_html, o + '/' + n) : '<p class="dim">No description.</p>') + '</div>';
   html += '<h2 class="sect">Comments (' + comments.length + ')</h2>';
   comments.forEach(c => {
@@ -2190,6 +2866,12 @@ async function renderIssue(o, n, num) {
       renderIssue(o, n, num);
     } catch (e) { toast('Failed: ' + e.message); $('#replyBtn').disabled = false; }
   });
+  const mb = $('#mergeBtn');
+  if (mb && pr) mb.addEventListener('click', async () => {
+    const canMerge = await canPushRepo(o, n).catch(() => false);
+    if (!canMerge) { toast('You do not have permission to merge here'); return; }
+    mergeSheet(o, n, num, pr);
+  });
 }
 
 /* ================= views: global issues + PRs ================= */
@@ -2204,18 +2886,20 @@ async function renderIssues() {
     '<button class="segb' + (IS.state === 'closed' ? ' on' : '') + '" data-is="closed">Closed</button></div>' +
     '<div class="seg sm" style="margin-bottom:12px"><button class="segb' + (IS.filter === 'created' ? ' on' : '') + '" data-if="created">Created</button>' +
     '<button class="segb' + (IS.filter === 'assigned' ? ' on' : '') + '" data-if="assigned">Assigned</button></div>' +
+    sortRowHTML('issues') +
     '<div id="issueList">' + spinner() + '</div>';
   $('#giNew').addEventListener('click', () => repoPickerSheet((o, n) => { closeSheet(); newIssueSheet(o, n); }));
   $$('[data-if]').forEach(b => b.addEventListener('click', () => { IS.filter = b.dataset.if; renderIssues(); }));
   $$('[data-is]').forEach(b => b.addEventListener('click', () => { IS.state = b.dataset.is; renderIssues(); }));
   $$('[data-it]').forEach(b => b.addEventListener('click', () => { IS.type = b.dataset.it; renderIssues(); }));
+  wireSortRow('issues', () => loadIssues());
   loadIssues();
 }
 async function loadIssues() {
   const seq = ++RSEQ;
   const list = $('#issueList'); if (!list) return;
   const paintIssues = items => {
-    const it = (items || []).filter(i => IS.type === 'prs' ? !!i.pull_request : !i.pull_request);
+    const it = sortItems((items || []).filter(i => IS.type === 'prs' ? !!i.pull_request : !i.pull_request), 'issues');
     if (seq !== RSEQ) return;
     list.innerHTML = it.length ? '<div class="card list">' + it.map(issueRow).join('') + '</div>' :
       '<div class="card empty">No ' + (IS.type === 'prs' ? 'pull requests' : 'issues') + ' here.</div>';
@@ -2224,10 +2908,7 @@ async function loadIssues() {
   if (ic && Array.isArray(ic)) paintIssues(ic);
   try {
     let items = await api('/issues?filter=' + IS.filter + '&state=' + IS.state + '&sort=updated&direction=desc&per_page=60');
-    items = items.filter(i => IS.type === 'prs' ? !!i.pull_request : !i.pull_request);
-    if (seq !== RSEQ) return;
-    list.innerHTML = items.length ? '<div class="card list">' + items.map(issueRow).join('') + '</div>' :
-      '<div class="card empty">No ' + (IS.type === 'prs' ? 'pull requests' : 'issues') + ' here.</div>';
+    paintIssues(items);
   } catch (e) { if (seq !== RSEQ) return; list.innerHTML = errCard(e); }
 }
 
@@ -2252,6 +2933,8 @@ async function renderNotifs() {
     });
     html += '</div>';
   }
+  NT_UNREAD = (items || []).filter(n => n.unread).length;
+  widgetPush();
   const nl = $('#notifList');
   if (nl && seq === RSEQ) nl.innerHTML = html;
   $('#markAll').addEventListener('click', async () => {
@@ -2306,7 +2989,7 @@ async function renderUser(login) {
     (u.bio ? '<p class="pbio">' + esc(u.bio) + '</p>' : '') +
     (u.location ? '<p class="pbio" style="margin-top:6px;font-size:12.5px">' + esc(u.location) + '</p>' : '') +
     '<div class="pstats">' +
-    '<div class="pstat" data-go="#/repos"><b>' + nf(u.public_repos) + '</b><span>repos</span></div>' +
+    '<div class="pstat" data-go="#/users/' + esc(u.login) + '/repos"><b>' + nf(u.public_repos) + '</b><span>repos</span></div>' +
     '<div class="pstat" data-go="#/users/' + esc(u.login) + '/followers"><b>' + nf(u.followers) + '</b><span>followers</span></div>' +
     '<div class="pstat" data-go="#/users/' + esc(u.login) + '/following"><b>' + nf(u.following) + '</b><span>following</span></div></div>';
   if (!self) {
@@ -2357,6 +3040,39 @@ async function renderUser(login) {
 }
 
 /* ================= views: user lists (followers / following) ================= */
+/* A user's own repositories - what tapping the "repos" count on their profile
+   opens. It used to jump to the Repositories tab, which showed your own or the
+   Discover list instead of theirs. */
+let URSORT = 'stars';
+async function renderUserRepos(login) {
+  const seq = ++RSEQ;
+  view().innerHTML = spinner();
+  let repos = cached('/users/' + login + '/repos?per_page=100&sort=pushed') || null;
+  if (!repos) {
+    try { repos = await api('/users/' + login + '/repos?per_page=100&sort=pushed'); }
+    catch (e) { if (seq === RSEQ) view().innerHTML = errCard(e); return; }
+  } else {
+    api('/users/' + login + '/repos?per_page=100&sort=pushed').catch(() => {});
+  }
+  if (seq !== RSEQ) return;
+  const sorters = {
+    stars: (a, b) => (b.stargazers_count || 0) - (a.stargazers_count || 0),
+    updated: (a, b) => new Date(b.pushed_at || 0) - new Date(a.pushed_at || 0),
+    name: (a, b) => String(a.name || '').localeCompare(String(b.name || ''))
+  };
+  const list = (repos || []).slice().sort(sorters[URSORT] || sorters.stars);
+  let html = '<div class="seg sm" style="margin-bottom:12px">' +
+    [['stars', 'Most stars'], ['updated', 'Recently updated'], ['name', 'Name A–Z']].map(x =>
+      '<button class="segb' + (URSORT === x[0] ? ' on' : '') + '" data-ursort="' + x[0] + '">' + x[1] + '</button>').join('') + '</div>';
+  html += '<div class="lsub" style="margin:-4px 0 10px 2px">' + nf((repos || []).length) + ' public repositories by @' + esc(login) + '</div>';
+  /* the rows are cards in their own right, so there is no big container card
+     behind them any more - the list sits straight on the page like GitHub's */
+  html += list.length ? '<div class="repogrid">' + list.map(r => repoRow(r)).join('') + '</div>'
+    : '<div class="card empty">@' + esc(login) + ' has no public repositories.</div>';
+  view().innerHTML = html;
+  $$('[data-ursort]').forEach(b => b.addEventListener('click', () => { URSORT = b.dataset.ursort; renderUserRepos(login); }));
+}
+
 async function renderUserList(login, which) {
   const seq = ++RSEQ;
   if (seq !== RSEQ) return;
@@ -2425,6 +3141,7 @@ function langBars(langs) {
 
 /* ================= views: settings ================= */
 let STAB = 'general';
+/* ================= GitHub account settings ================= */
 function renderSettings() {
   const seq = ++RSEQ;
   const u = USER || {};
@@ -2455,6 +3172,9 @@ function renderSettings() {
     return;
   }
   const cur = LS.get('theme', 'light');
+  html += '<h2 class="sect">GitHub account</h2><div class="card">' +
+    '<div class="lrow" style="padding:12px 0"><div class="lmain"><div class="ltitle">Sign-in method</div><div class="lsub lsubwrap">' + esc(loginMethodLabel()) +
+    (TOKEN_SCOPES ? ' · scopes: ' + esc(TOKEN_SCOPES) : (loginMethod() === 'fine' ? ' · permissions are chosen per token on github.com' : '')) + '</div></div></div></div>';
   const themes = { light: 'Light', dark: 'Dark', pitch: 'Pitch black' };
   const accents = { blue: ['#1B6EF3', 'Blue'], purple: ['#8B5CF6', 'Purple'], green: ['#12B76A', 'Green'], pink: ['#EC4899', 'Pink'], amber: ['#F59E0B', 'Amber'], teal: ['#14B8A6', 'Teal'], red: ['#EF4444', 'Red'], indigo: ['#6366F1', 'Indigo'], dynamic: ['', 'Dynamic'], custom: ['', 'Custom'] };
   const curA = LS.get('accent', 'blue');
@@ -2474,6 +3194,11 @@ function renderSettings() {
     '<button class="switch' + (LS.get('glow', true) ? ' on' : '') + '" id="glowSw" aria-label="glow effects"></button></div></div>';
   html += '<div class="card"><div class="setrow"><div class="lmain"><div class="ltitle">Navigation glow</div><div class="lsub">Adds an accent-colored glow around the bottom navigation bar and its active tab. Off by default for a cleaner look.</div></div>' +
     '<button class="switch' + (LS.get('navglow', false) ? ' on' : '') + '" id="navglowSw" aria-label="navigation glow"></button></div></div>';
+  html += '<h2 class="sect">Accessibility</h2>';
+  html += '<div class="card"><div class="setrow"><div class="lmain"><div class="ltitle">Reduce motion</div><div class="lsub">Turns off animations and transitions throughout the app</div></div>' +
+    '<button class="switch' + (LS.get('reduceMotion', false) ? ' on' : '') + '" id="motionSw" aria-label="reduce motion"></button></div></div>';
+  html += '<div class="card"><div class="setrow"><div class="lmain"><div class="ltitle">Show link underlines</div><div class="lsub">Underlines links in READMEs, comments and descriptions</div></div>' +
+    '<button class="switch' + (LS.get('linkUnderline', false) ? ' on' : '') + '" id="underlineSw" aria-label="link underlines"></button></div></div>';
   html += '<h2 class="sect">App updates</h2>';
   html += '<div class="card"><div class="setrow"><div class="lmain"><div class="ltitle">Auto-download app updates</div><div class="lsub">When you publish a new Gitly release on GitHub, the update APK is downloaded to your Downloads folder automatically.</div></div>' +
     '<button class="switch' + (LS.get('autodl', false) ? ' on' : '') + '" id="autodlSw" aria-label="auto download updates"></button></div>' +
@@ -2483,7 +3208,8 @@ function renderSettings() {
     '<div id="updInfo"></div></div>';
   html += '<h2 class="sect">Notifications</h2>';
   html += '<div class="card"><div class="setrow"><div class="lmain"><div class="ltitle">GitHub activity alerts</div><div class="lsub">System notifications for new issues, pull requests, mentions, reviews, releases and CI results on repos you watch or participate in. Checked in the background roughly every 15 minutes — works even when the app is closed.</div></div>' +
-    '<button class="switch' + (LS.get('notify', true) ? ' on' : '') + '" id="notifSw" aria-label="notifications"></button></div></div>';
+    '<button class="switch' + (LS.get('notify', true) ? ' on' : '') + '" id="notifSw" aria-label="notifications"></button></div>' +
+    '</div>';
   html += '<h2 class="sect">Sync across devices</h2>';
   html += '<div class="card"><p style="margin:0;font-size:13.5px;color:var(--text2);line-height:1.6">Sign in with the same GitHub account on any device and Gitly pulls your data from GitHub. Your pins, theme and preferences are also saved to a private Gist in your account, so a new device picks up where you left off. Your access token stays on this device only — it is never synced.</p>' +
     '<div class="btncol"><button class="btn primary" data-act="synctoast">Sync now</button><button class="btn ghost" data-act="syncrestore">Restore from GitHub</button></div>' +
@@ -2546,6 +3272,20 @@ function renderSettings() {
     nsw.classList.toggle('on', on);
     LS.set('navglow', on); applyTheme(); queueSync();
     toast(on ? 'Navigation glow on' : 'Navigation glow off');
+  });
+  const msw = $('#motionSw');
+  if (msw) msw.addEventListener('click', () => {
+    const on = !msw.classList.contains('on');
+    msw.classList.toggle('on', on);
+    LS.set('reduceMotion', on); applyA11y(); queueSync();
+    toast(on ? 'Reduced motion — animations off' : 'Animations on');
+  });
+  const usw = $('#underlineSw');
+  if (usw) usw.addEventListener('click', () => {
+    const on = !usw.classList.contains('on');
+    usw.classList.toggle('on', on);
+    LS.set('linkUnderline', on); applyA11y(); queueSync();
+    toast(on ? 'Link underlines shown' : 'Link underlines hidden');
   });
   const adw = $('#autodlSw');
   if (adw) adw.addEventListener('click', () => {
@@ -2624,6 +3364,7 @@ const ACTIONS = {
     if (e) e.preventDefault ? e.preventDefault() : null;
     try { window.location.href = 'https://raw.githubusercontent.com/' + el.dataset.owner + '/' + el.dataset.repo + '/HEAD/' + el.dataset.path; } catch (err) {}
   },
+  deployments: el => deploymentsSheet(el.dataset.full),
   openfile: async el => {
     const full = el.dataset.repo, path = el.dataset.file;
     openSheet('<div class="sheethead"><b>' + esc(path.split('/').pop()) + '</b><button class="iconbtn" data-act="closesheet">' + SVG.x + '</button></div>' + spinner(true));
@@ -2643,12 +3384,24 @@ const ACTIONS = {
         if (lines.length > 2000) { shown = lines.slice(0, 2000).join('\n'); cut = true; }
         card.innerHTML = '<div class="sheethead"><b>' + esc(path) + '</b><button class="iconbtn" data-act="closesheet">' + SVG.x + '</button></div>' +
           '<pre class="filepre">' + esc(shown || '(empty file)') + (cut ? '\n\n… — this file is large, showing the first ' + nf(Math.min(raw.length, MAX)) + ' characters.' : '') + '</pre>';
-        if (raw) {
-          card.innerHTML += '<div style="display:flex;gap:8px;margin-top:12px">' +
-            '<button class="btn ghost" id="editFileBtn" style="flex:1">Edit</button>' +
-            '<button class="btn danger" id="delFileBtn" style="flex:1">Delete</button></div>';
-          $('#editFileBtn').addEventListener('click', () => editFileSheet(full, path, raw, meta.sha));
-          $('#delFileBtn').addEventListener('click', () => deleteFileSheet(full, path, meta.sha));
+        {
+          const parts = full.split('/');
+          const fname = path.split('/').pop() || 'file';
+          const canEdit = await canPushRepo(parts[0], parts[1]);
+          /* Download is offered for every file - including binaries the viewer
+             cannot show (a .ttf, a .keystore, anything over 1MB) */
+          let acts = '<div style="display:flex;gap:8px;margin-top:12px">' +
+            '<button class="btn ghost" data-act="apidl" data-owner="' + esc(parts[0]) + '" data-repo="' + esc(parts[1]) + '" data-path="' + esc(path) + '" data-name="' + esc(fname) + '" style="flex:1;display:flex;align-items:center;justify-content:center;gap:8px">' + SVG.dl + '<span>Download</span></button>';
+          if (canEdit && raw) {
+            acts += '<button class="btn ghost" id="editFileBtn" style="flex:1">Edit</button>' +
+              '<button class="btn danger" id="delFileBtn" style="flex:1">Delete</button>';
+          }
+          acts += '</div>';
+          card.innerHTML += acts;
+          if (canEdit && raw) {
+            $('#editFileBtn').addEventListener('click', () => editFileSheet(full, path, raw, meta.sha));
+            $('#delFileBtn').addEventListener('click', () => deleteFileSheet(full, path, meta.sha));
+          }
         }
       }
     } catch (e) { closeSheet(); toast('Cannot open this file'); }
@@ -2712,7 +3465,8 @@ document.addEventListener('click', e => {
   const a = e.target.closest('a[href]');
   if (a) {
     const href = a.getAttribute('href') || '';
-    if (href.charAt(0) === '#') {
+    /* in-page anchors from GitHub content only (app routes use #/…) */
+    if (href.charAt(0) === '#' && href.charAt(1) !== '/') {
       /* in-page anchor - scroll to the heading, never touch the route */
       e.preventDefault();
       const id = href.slice(1).replace(/[^\w-]/g, '');
@@ -2732,19 +3486,32 @@ document.addEventListener('click', e => {
   }
 });
 $('#sheet').addEventListener('click', e => { if (e.target.id === 'sheet') closeSheet(); });
+/* keyboard + window handling for desktop and laptop use */
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') {
+    const s = $('#sheet');
+    if (s && !s.hidden) { closeSheet(); return; }
+  }
+});
+window.addEventListener('resize', () => { if (isWide()) navShow(); });
 /* ---- bottom nav auto-hide: hides on scroll-down and after idle, returns on any touch or scroll-up ---- */
 let lastY = 0, idleT = null;
+/* on a laptop the navigation is a permanent rail, so the auto-hide behaviour
+   is limited to the phone layout */
+function isWide() { try { return window.innerWidth >= 1080; } catch (e) { return false; } }
 function navShow() { const nb = $('#navbar'); if (nb) nb.classList.remove('hide'); resetIdle(); }
-function navHide() { const nb = $('#navbar'); if (nb) nb.classList.add('hide'); clearTimeout(idleT); }
+function navHide() { if (isWide()) return; const nb = $('#navbar'); if (nb) nb.classList.add('hide'); clearTimeout(idleT); }
 function resetIdle() {
   clearTimeout(idleT);
-  idleT = setTimeout(() => { const sc = $('#scroller'); if (sc && sc.scrollTop > 150) navHide(); }, 4000);
+  idleT = setTimeout(() => { if (isWide()) return; const sc = $('#scroller'); if (sc && sc.scrollTop > 150) navHide(); }, 4000);
 }
 $('#scroller').addEventListener('scroll', () => {
   const sc = $('#scroller'); const y = sc.scrollTop;
   $('#appbar').classList.toggle('on', y > 110);
-  if (y > lastY + 10 && y > 80) navHide();
-  else if (y < lastY - 10) navShow();
+  if (!isWide()) {
+    if (y > lastY + 10 && y > 80) navHide();
+    else if (y < lastY - 10) navShow();
+  }
   lastY = y;
   resetIdle();
 });
@@ -2755,11 +3522,8 @@ $('#backApp').addEventListener('click', () => history.back());
 const doRefresh = () => { view().innerHTML = spinner(); route(); };
 $('#refreshBig').addEventListener('click', doRefresh);
 $('#refreshApp').addEventListener('click', doRefresh);
-$('#loginBtn').addEventListener('click', async () => {
-  const tok = $('#tokenInput').value.trim();
-  if (!tok) { toast('Paste your GitHub token first'); return; }
-  const btn = $('#loginBtn');
-  btn.disabled = true; btn.textContent = 'Signing in…'; $('#loginErr').textContent = '';
+/* shared by token login and OAuth: validates the token, stores it, restores sync */
+async function completeLogin(tok) {
   const old = TOKEN; TOKEN = tok;
   try {
     USER = await api('/user');
@@ -2772,14 +3536,118 @@ $('#loginBtn').addEventListener('click', async () => {
     saveGistToAccount();
     if (location.hash === '#/home' || location.hash === '') route();
     else location.hash = '#/home';
+    widgetPush();
     toast(restored ? 'Welcome back — data restored from GitHub' : 'Welcome, ' + USER.login);
   } catch (e) {
     TOKEN = old; USER = null;
+    throw e;
+  }
+}
+$('#loginBtn').addEventListener('click', async () => {
+  const tok = $('#tokenInput').value.trim();
+  if (!tok) { toast('Paste your GitHub token first'); return; }
+  const btn = $('#loginBtn');
+  btn.disabled = true; btn.textContent = 'Signing in…'; $('#loginErr').textContent = '';
+  try {
+    await completeLogin(tok);
+  } catch (e) {
     $('#loginErr').textContent = (e.message || 'Sign-in failed') + ' — check the token and its scopes.';
     toast('Sign-in failed');
   }
   btn.disabled = false; btn.textContent = 'Sign in';
 });
+
+/* The device flow needs the native bridge (GitHub's OAuth endpoints send no
+   CORS headers, so the page cannot call them itself). On the published website
+   we hide that button and leave the personal-access-token sign-in, which works
+   from a plain browser. */
+try {
+  if (!(window.OneGit && window.OneGit.oauthStart)) {
+    const gb = document.getElementById('ghLoginBtn');
+    if (gb) gb.hidden = true;
+    const dv = document.getElementById('loginDivider');
+    if (dv) dv.hidden = true;
+  }
+} catch (e) {}
+
+/* ================= GitHub OAuth sign-in (device flow, no secret needed) ================= */
+const OAUTH_SCOPES = 'repo read:user notifications gist';
+let oauthTimer = null, oauthBusy = false;
+function oauthPending() {
+  const p = LS.get('oauth.pending', null);
+  return (p && p.device_code && Date.now() < p.expires) ? p : null;
+}
+window.__oauthStart = (ok, resp) => {
+  const btn = $('#ghLoginBtn');
+  if (btn) btn.disabled = false;
+  if (!ok) { toast('Could not start sign-in: ' + resp); return; }
+  let j = {};
+  try { j = JSON.parse(resp) || {}; } catch (e) {}
+  if (!j.device_code || !j.user_code) { toast('Could not start sign-in' + (j.error_description ? ' — ' + j.error_description : '')); return; }
+  LS.set('oauth.pending', { device_code: j.device_code, user_code: j.user_code, interval: j.interval || 5, expires: Date.now() + (j.expires_in || 900) * 1000 });
+  try { if (window.OneGit && OneGit.copy) OneGit.copy(j.user_code); } catch (e) {}
+  clearTimeout(oauthTimer);
+  showDeviceSheet();
+  scheduleOauthPoll();
+};
+window.__oauthPoll = (ok, resp) => {
+  oauthBusy = false;
+  const p = oauthPending();
+  if (!p) return;
+  let j = {};
+  try { j = JSON.parse(resp) || {}; } catch (e) {}
+  if (ok && j.access_token) {
+    LS.del('oauth.pending');
+    clearTimeout(oauthTimer);
+    closeSheet();
+    toast('Signed in with GitHub');
+    completeLogin(j.access_token).catch(e => { toast('Sign-in failed: ' + e.message); });
+    return;
+  }
+  const err = j.error || '';
+  if (err === 'authorization_pending') { scheduleOauthPoll(); return; }
+  if (err === 'slow_down') { p.interval = (p.interval || 5) + 5; LS.set('oauth.pending', p); scheduleOauthPoll(); return; }
+  if (err === 'expired_token') { LS.del('oauth.pending'); clearTimeout(oauthTimer); toast('Sign-in code expired — start again'); return; }
+  if (err === 'access_denied') { LS.del('oauth.pending'); clearTimeout(oauthTimer); toast('Sign-in was denied on GitHub'); return; }
+  scheduleOauthPoll();
+};
+function oauthPollNow() {
+  const p = oauthPending();
+  if (!p) { clearTimeout(oauthTimer); return; }
+  if (oauthBusy) return;
+  if (!window.OneGit || !OneGit.oauthPoll) { toast('Not available in this build'); return; }
+  oauthBusy = true;
+  try { OneGit.oauthPoll(p.device_code); } catch (e) { oauthBusy = false; }
+}
+function scheduleOauthPoll() {
+  clearTimeout(oauthTimer);
+  const p = oauthPending();
+  if (!p) return;
+  oauthTimer = setTimeout(oauthPollNow, Math.max(3, p.interval || 5) * 1000);
+}
+function showDeviceSheet() {
+  const p = oauthPending();
+  if (!p) return;
+  const mins = Math.max(1, Math.round((p.expires - Date.now()) / 60000));
+  openSheet('<div class="sheethead"><b>Sign in with GitHub</b><button class="iconbtn" data-act="closesheet">' + SVG.x + '</button></div>' +
+    '<div class="card" style="text-align:center;padding:22px 16px">' +
+    '<div class="lsub">Enter this code at</div>' +
+    '<div class="ltitle" style="margin:2px 0 12px">github.com/login/device</div>' +
+    '<div style="font-size:34px;font-weight:800;letter-spacing:4px">' + esc(p.user_code) + '</div>' +
+    '<div class="lsub" style="margin-top:10px">Copied to your clipboard</div></div>' +
+    '<button class="btn primary btnblock" data-act="ext" data-url="https://github.com/login/device" style="margin-top:4px">Open github.com/login/device</button>' +
+    '<button class="btn ghost btnblock" id="oauthContinue" style="margin-top:8px">Continue — I approved on GitHub</button>' +
+    '<div class="lsub" style="margin-top:12px;text-align:center">GitHub does not redirect back — approve there, then return. The code expires in ' + mins + ' minutes; sign-in finishes automatically even if you close this.</div>');
+  const oc = $('#oauthContinue');
+  if (oc) oc.addEventListener('click', () => { oauthPollNow(); toast('Checking GitHub…'); });
+}
+function startDeviceLogin() {
+  if (!window.OneGit || !OneGit.oauthStart) { toast('Not available in this build'); return; }
+  const btn = $('#ghLoginBtn');
+  if (btn) { btn.disabled = true; }
+  try { OneGit.oauthStart(OAUTH_SCOPES); } catch (e) { if (btn) btn.disabled = false; }
+}
+$('#ghLoginBtn').addEventListener('click', startDeviceLogin);
 $('#tokenInput').addEventListener('keydown', e => { if (e.key === 'Enter') $('#loginBtn').click(); });
 window.addEventListener('hashchange', route);
 window.addEventListener('resize', fitBigTitle);
@@ -2843,3 +3711,498 @@ applyFont();
 saveTokenNative();
 route();
 if (TOKEN) syncRestore(true).then(ok => { if (ok && (location.hash === '#/home' || location.hash === '')) route(); }).catch(() => {});
+
+/* ================= v2.78: pull requests, actions, security, insights, deployments,
+   pages, environments, interaction limits, branch protection, SSH/GPG keys,
+   organizations and accessibility settings ================= */
+
+/* Hand the numbers the app already has to the home screen widgets. They are
+   stored on the device, so the widget shows them straight away and keeps them
+   after the app is closed - no background fetch required. */
+let NT_UNREAD = -1;
+function widgetPush() {
+  try {
+    if (!window.OneGit || !OneGit.widgetSync) return;
+    const p = { login: (USER && USER.login) ? USER.login : '' };
+    try {
+      const a = getComputedStyle(document.documentElement).getPropertyValue('--accent').trim();
+      if (/^#[0-9A-Fa-f]{6}$/.test(a)) p.accent = a.toUpperCase();
+    } catch (e) {}
+    const cc = LS.get('c.prod', null);
+    if (cc && cc.contributionCalendar) {
+      const days = [];
+      cc.contributionCalendar.weeks.forEach(w => w.contributionDays.forEach(d => days.push(d)));
+      const today = todayStr();
+      let cur = 0, i = days.length - 1;
+      while (i >= 0 && days[i].contributionCount === 0) i--;
+      while (i >= 0 && days[i].contributionCount > 0) { cur++; i--; }
+      const td = days.filter(d => d.date === today)[0];
+      p.today = td ? td.contributionCount : 0;
+      p.streak = cur;
+      p.total = cc.contributionCalendar.totalContributions || 0;
+    }
+    if (NT_UNREAD >= 0) p.unread = NT_UNREAD;
+    if (!p.login && !cc && NT_UNREAD < 0) return;
+    OneGit.widgetSync(JSON.stringify(p));
+  } catch (e) {}
+}
+function applyA11y() {
+  document.body.classList.toggle('reducemotion', !!LS.get('reduceMotion', false));
+  document.body.classList.toggle('showunderline', !!LS.get('linkUnderline', false));
+}
+
+/* ---------- pull requests ---------- */
+let PRS = { state: 'open' };
+async function renderPulls(o, n) {
+  const seq = ++RSEQ;
+  const full = o + '/' + n;
+  const canPush = await canPushRepo(o, n).catch(() => false);
+  if (seq !== RSEQ) return;
+  view().innerHTML = (canPush ? '<button class="btn ghost btnblock" id="newPrBtn" style="margin-bottom:12px">New pull request</button>' : '') +
+    '<div class="seg sm" style="margin-bottom:12px"><button class="segb' + (PRS.state === 'open' ? ' on' : '') + '" data-prs="open">Open</button>' +
+    '<button class="segb' + (PRS.state === 'closed' ? ' on' : '') + '" data-prs="closed">Closed</button>' +
+    '<button class="segb' + (PRS.state === 'all' ? ' on' : '') + '" data-prs="all">All</button></div>' +
+    '<div id="prList">' + spinner() + '</div>';
+  const nb = $('#newPrBtn'); if (nb) nb.addEventListener('click', () => newPullSheet(o, n));
+  $$('[data-prs]').forEach(b => b.addEventListener('click', () => { PRS.state = b.dataset.prs; renderPulls(o, n); }));
+  let prs;
+  try { prs = await api('/repos/' + full + '/pulls?state=' + PRS.state + '&sort=updated&direction=desc&per_page=30'); }
+  catch (e) { if (seq === RSEQ) { const l = $('#prList'); if (l) l.innerHTML = errCard(e); } return; }
+  if (seq !== RSEQ) return;
+  let html = '';
+  if (!prs.length) html = '<div class="card empty">No ' + (PRS.state === 'all' ? '' : PRS.state + ' ') + 'pull requests here.</div>';
+  else {
+    html = '<div class="card list">';
+    prs.forEach(p => {
+      const merged = !!p.merged_at;
+      html += '<div class="lrow" data-go="#/issue/' + full + '/' + p.number + '">' +
+        '<div class="istate' + (merged ? ' merged' : (p.state === 'open' ? '' : ' closed')) + '">' + (merged ? SVG.check : (p.state === 'open' ? SVG.dot : SVG.x)) + '</div>' +
+        '<div class="lmain"><div class="ltitle">' + esc(p.title) + (p.draft ? ' <span class="chip">Draft</span>' : '') + (merged ? ' <span class="chip ok">Merged</span>' : '') + '</div>' +
+        '<div class="lsub">#' + p.number + ' · ' + esc(p.user.login) + ' · ' + esc(p.head.ref) + ' → ' + esc(p.base.ref) + ' · ' + tAgo(p.updated_at) + ' · ' + (p.comments || 0) + ' comments</div></div></div>';
+    });
+    html += '</div>';
+  }
+  const pl = $('#prList'); if (pl) pl.innerHTML = html;
+}
+function newPullSheet(o, n) {
+  const full = o + '/' + n;
+  openSheet('<div class="sheethead"><b>New pull request</b><button class="iconbtn" data-act="closesheet">' + SVG.x + '</button></div>' +
+    '<div id="prForm">' + spinner(true) + '</div>');
+  api('/repos/' + full).then(async r => {
+    const branches = await api('/repos/' + full + '/branches?per_page=100').catch(() => []);
+    const f = $('#prForm'); if (!f) return;
+    f.innerHTML = '<label class="fldlabel">Base branch</label><select class="fld" id="prBase">' +
+      branches.map(b => '<option value="' + esc(b.name) + '"' + (b.name === r.default_branch ? ' selected' : '') + '>' + esc(b.name) + '</option>').join('') + '</select>' +
+      '<label class="fldlabel" style="margin-top:12px">Compare branch (your changes)</label><select class="fld" id="prHead">' +
+      branches.map(b => '<option value="' + esc(b.name) + '"' + (b.name !== r.default_branch ? ' selected' : '') + '>' + esc(b.name) + '</option>').join('') + '</select>' +
+      '<label class="fldlabel" style="margin-top:12px">Title</label><input class="fld" id="prTitle" autocomplete="off">' +
+      '<label class="fldlabel" style="margin-top:12px">Description</label><textarea class="fld" id="prBody" rows="4"></textarea>' +
+      '<button class="btn primary btnblock" id="prGo" style="margin-top:16px">Create pull request</button>';
+    $('#prGo').addEventListener('click', async () => {
+      const title = $('#prTitle').value.trim();
+      if (!title) { toast('Add a title first'); return; }
+      $('#prGo').disabled = true;
+      try {
+        const pr = await api('/repos/' + full + '/pulls', { method: 'POST', body: JSON.stringify({ title: title, body: $('#prBody').value, head: $('#prHead').value, base: $('#prBase').value }) });
+        closeSheet(); toast('Pull request #' + pr.number + ' created');
+        location.hash = '#/issue/' + full + '/' + pr.number;
+      } catch (e) { toast('Failed: ' + e.message); $('#prGo').disabled = false; }
+    });
+  }).catch(e => { const f = $('#prForm'); if (f) f.innerHTML = errCard(e); });
+}
+function mergeSheet(o, n, num, pr) {
+  const full = o + '/' + n;
+  let method = 'merge';
+  openSheet('<div class="sheethead"><b>Merge pull request #' + num + '</b><button class="iconbtn" data-act="closesheet">' + SVG.x + '</button></div>' +
+    '<div class="lsub">' + esc(pr.head.ref) + ' → ' + esc(pr.base.ref) +
+    (pr.mergeable === false ? ' · GitHub reports this branch has conflicts that must be resolved first' : '') + '</div>' +
+    '<div class="seg sm" style="margin-top:14px"><button class="segb on" data-mm="merge">Merge</button>' +
+    '<button class="segb" data-mm="squash">Squash</button><button class="segb" data-mm="rebase">Rebase</button></div>' +
+    '<div class="lsub" style="margin-top:10px">Pick how the commits land in ' + esc(pr.base.ref) + '.</div>' +
+    '<button class="btn primary btnblock" id="mgGo" style="margin-top:16px">Merge now</button>');
+  $$('[data-mm]').forEach(b => b.addEventListener('click', () => { method = b.dataset.mm; $$('[data-mm]').forEach(x => x.classList.toggle('on', x === b)); }));
+  $('#mgGo').addEventListener('click', async () => {
+    $('#mgGo').disabled = true;
+    try {
+      await api('/repos/' + full + '/pulls/' + num + '/merge', { method: 'PUT', body: JSON.stringify({ merge_method: method }) });
+      closeSheet(); toast('Merged pull request #' + num); renderIssue(o, n, num);
+    } catch (e) { toast('Failed: ' + e.message); $('#mgGo').disabled = false; }
+  });
+}
+
+/* ---------- actions ---------- */
+function runIcon(conclusion, status) {
+  let cls = 'mute', svg = SVG.dot;
+  if (status === 'queued' || status === 'in_progress' || status === 'waiting' || status === 'pending') { cls = 'run'; svg = SVG.dot; }
+  else if (conclusion === 'success') { cls = 'ok'; svg = SVG.check; }
+  else if (conclusion === 'failure' || conclusion === 'timed_out' || conclusion === 'startup_failure') { cls = 'bad'; svg = SVG.x; }
+  else if (conclusion === 'cancelled' || conclusion === 'skipped' || conclusion === 'neutral') { cls = 'mute'; svg = SVG.x; }
+  return '<div class="runstate ' + cls + '">' + svg + '</div>';
+}
+function runDur(r) {
+  const end = r.updated_at ? new Date(r.updated_at) : null, st = new Date(r.run_started_at || r.created_at);
+  if (!end || end <= st) return '';
+  let s = Math.round((end - st) / 1000);
+  return s >= 3600 ? Math.floor(s / 3600) + 'h ' + Math.floor((s % 3600) / 60) + 'm' : s >= 60 ? Math.floor(s / 60) + 'm ' + (s % 60) + 's' : s + 's';
+}
+async function renderActions(o, n) {
+  const seq = ++RSEQ;
+  const full = o + '/' + n;
+  view().innerHTML = '<div id="runList">' + spinner() + '</div>';
+  let runs;
+  try { runs = ((await api('/repos/' + full + '/actions/runs?per_page=30')) || {}).workflow_runs || []; }
+  catch (e) { if (seq === RSEQ) view().innerHTML = errCard(e); return; }
+  if (seq !== RSEQ) return;
+  let html;
+  if (!runs.length) html = '<div class="card empty">No workflow runs yet.<div class="lsub" style="margin-top:8px">Actions run automatically on push and other events once the repository has workflow files in .github/workflows.</div></div>';
+  else {
+    html = '<div class="card list">' + runs.map(r =>
+      '<div class="lrow" data-go="#/actionrun/' + full + '/' + r.id + '">' + runIcon(r.conclusion, r.status) +
+      '<div class="lmain"><div class="ltitle">' + esc(r.name || 'Workflow run') + '</div>' +
+      '<div class="lsub">#' + r.run_number + ' · ' + esc(r.head_branch || '-') + ' · ' + esc(r.event) +
+      (runDur(r) ? ' · ' + runDur(r) : '') + ' · ' + tAgo(r.created_at) + '</div></div></div>').join('') + '</div>';
+  }
+  const rl = $('#runList'); if (rl) rl.innerHTML = html;
+}
+async function renderRun(o, n, id) {
+  const seq = ++RSEQ;
+  const full = o + '/' + n;
+  view().innerHTML = spinner();
+  let run, jobs;
+  try {
+    run = await api('/repos/' + full + '/actions/runs/' + id);
+    jobs = ((await api('/repos/' + full + '/actions/runs/' + id + '/jobs?per_page=30')) || {}).jobs || [];
+  } catch (e) { if (seq === RSEQ) view().innerHTML = errCard(e); return; }
+  if (seq !== RSEQ) return;
+  const active = run.status === 'queued' || run.status === 'in_progress' || run.status === 'waiting';
+  let html = '<div class="card"><div class="rcrow"><div class="rcname">' + esc(run.name || 'Workflow run') + '</div>' + runIcon(run.conclusion, run.status) + '</div>' +
+    '<div class="rcmeta">run #' + run.run_number + ' · ' + esc(run.event) + ' · branch ' + esc(run.head_branch || '-') +
+    ' · commit ' + (run.head_sha ? run.head_sha.slice(0, 7) : '') + '</div>' +
+    '<div class="lsub" style="margin-top:6px">Started ' + tAgo(run.run_started_at || run.created_at) + ' by ' + esc(run.actor ? run.actor.login : 'unknown') +
+    ' · ' + esc(active ? run.status : (run.conclusion || run.status)) + (runDur(run) ? ' · took ' + runDur(run) : '') + '</div>' +
+    '<div class="actionrow" style="margin-top:14px">' +
+    (active ? '<button class="btn danger" id="runCancel">Cancel run</button>' : '<button class="btn ghost" id="runRerun">Re-run</button>') +
+    '<button class="btn ghost" data-act="ext" data-url="' + esc(run.html_url) + '">' + SVG.ext + '<span>Open on GitHub</span></button></div></div>';
+  html += '<h2 class="sect">Jobs</h2>';
+  if (!jobs.length) html += '<div class="card empty">No job details for this run.</div>';
+  else {
+    html += '<div class="card list">' + jobs.map(j =>
+      '<div class="lrow" style="flex-wrap:wrap">' + runIcon(j.conclusion, j.status) +
+      '<div class="lmain" style="flex:1"><div class="ltitle">' + esc(j.name) + '</div>' +
+      '<div class="lsub">' + esc(j.status) + (j.conclusion ? ' · ' + esc(j.conclusion) : '') + (j.runner_name ? ' · ' + esc(j.runner_name) : '') + '</div>' +
+      ((j.steps || []).length ? '<div class="steps">' + j.steps.map(s =>
+        '<div class="step">' + (s.conclusion === 'success' ? '<span style="color:#12B76A">✓</span>' : (s.conclusion === 'failure' ? '<span style="color:#EF4444">✗</span>' : '<span>•</span>')) + esc(s.name) + '</div>').join('') + '</div>' : '') +
+      '</div></div>').join('') + '</div>';
+  }
+  view().innerHTML = html;
+  const cc = $('#runCancel');
+  if (cc) cc.addEventListener('click', async () => {
+    cc.disabled = true;
+    try { await api('/repos/' + full + '/actions/runs/' + id + '/cancel', { method: 'POST' }); toast('Cancelling run…'); renderRun(o, n, id); }
+    catch (e) { toast('Failed: ' + e.message); cc.disabled = false; }
+  });
+  const rr = $('#runRerun');
+  if (rr) rr.addEventListener('click', async () => {
+    rr.disabled = true;
+    try { await api('/repos/' + full + '/actions/runs/' + id + '/rerun', { method: 'POST' }); toast('Re-running…'); setTimeout(() => renderRun(o, n, id), 1500); }
+    catch (e) { toast('Failed: ' + e.message); rr.disabled = false; }
+  });
+}
+
+/* ---------- security and quality ---------- */
+async function renderSecurity(o, n) {
+  const seq = ++RSEQ;
+  const full = o + '/' + n;
+  view().innerHTML = spinner();
+  const canAdmin = await canPushRepo(o, n).catch(() => false);
+  const [dep, depFix, secret, alerts] = await Promise.all([
+    api('/repos/' + full + '/vulnerability-alerts', { status: true }).catch(() => null),
+    api('/repos/' + full + '/automated-security-fixes', { status: true }).catch(() => null),
+    api('/repos/' + full + '/secret-scanning').catch(() => null),
+    api('/repos/' + full + '/dependabot/alerts?per_page=20&state=open').catch(() => null)
+  ]);
+  if (seq !== RSEQ) return;
+  const depOn = !!(dep && dep.status === 204);
+  const fixOn = !!(depFix && depFix.status === 204);
+  let html = '<div class="card"><div class="ltitle" style="padding:2px 4px 4px;font-size:15px">Dependabot alerts</div>' +
+    '<div class="setrow"><div class="lmain"><div class="ltitle">Alerts for vulnerable dependencies</div>' +
+    '<div class="lsub">Get notified when one of your dependencies has a known vulnerability</div></div>' +
+    '<button class="switch' + (depOn ? ' on' : '') + '" id="secDepSw" aria-label="dependabot alerts"></button></div>' +
+    (depOn && Array.isArray(alerts) && alerts.length ?
+      '<div style="margin-top:12px">' + alerts.map(a =>
+        '<div class="lrow" style="padding:10px 0" data-act="ext" data-url="' + esc(a.html_url) + '">' +
+        '<div class="lmain"><div class="ltitle">' + esc((a.security_vulnerability && a.security_vulnerability.package && a.security_vulnerability.package.name) || ('Alert #' + a.number)) + '</div>' +
+        '<div class="lsub">' + esc((a.security_vulnerability && a.security_vulnerability.severity) || 'unknown') + ' severity · ' + esc(a.state) + '</div></div></div>').join('') + '</div>' : '') +
+    '</div>';
+  html += '<div class="card"><div class="ltitle" style="padding:2px 4px 4px;font-size:15px">Dependabot version updates</div>' +
+    '<div class="setrow"><div class="lmain"><div class="ltitle">Automated security fixes</div>' +
+    '<div class="lsub">Let Dependabot open pull requests that update vulnerable dependencies</div></div>' +
+    '<button class="switch' + (fixOn ? ' on' : '') + '" id="secFixSw" aria-label="automated fixes"></button></div></div>';
+  html += '<div class="card"><div class="ltitle" style="padding:2px 4px 4px;font-size:15px">Secret scanning</div>' +
+    '<div class="setrow"><div class="lmain"><div class="ltitle">Scan for committed secrets</div>' +
+    '<div class="lsub">Get notified when tokens, keys and other secrets are pushed to this repository' +
+    (secret ? ' · currently ' + esc(secret.state) : '') + '</div></div>' +
+    '<button class="switch' + (secret && secret.state === 'enabled' ? ' on' : '') + '" id="secSecretSw" aria-label="secret scanning"></button></div></div>';
+  html += '<div class="card"><div class="ltitle" style="padding:2px 4px 4px;font-size:15px">Security policy</div>' +
+    '<div class="lrow" data-act="openfile" data-repo="' + esc(full) + '" data-file="SECURITY.md" style="padding:10px 0">' +
+    '<div class="lmain"><div class="ltitle">View SECURITY.md</div><div class="lsub">How users should report vulnerabilities for this repository</div></div></div>' +
+    '<div class="lrow" data-act="ext" data-url="https://github.com/' + esc(full) + '/security" style="padding:10px 0">' +
+    '<div class="lmain"><div class="ltitle">Security overview on GitHub</div><div class="lsub">Code scanning, advisories and full alert history</div></div></div></div>';
+  view().innerHTML = html;
+  if (!canAdmin) view().insertAdjacentHTML('afterbegin', '<div class="card empty">Read-only view — changing security settings requires admin access to this repository.</div>');
+  const dsw = $('#secDepSw');
+  if (dsw) dsw.addEventListener('click', async () => {
+    const on = !dsw.classList.contains('on');
+    try { await api('/repos/' + full + '/vulnerability-alerts', { method: on ? 'PUT' : 'DELETE' }); dsw.classList.toggle('on', on); toast(on ? 'Dependabot alerts enabled' : 'Dependabot alerts disabled'); if (on) setTimeout(() => renderSecurity(o, n), 800); }
+    catch (e) { toast('Failed: ' + e.message); }
+  });
+  const fsw = $('#secFixSw');
+  if (fsw) fsw.addEventListener('click', async () => {
+    const on = !fsw.classList.contains('on');
+    try { await api('/repos/' + full + '/automated-security-fixes', { method: on ? 'PUT' : 'DELETE' }); fsw.classList.toggle('on', on); toast(on ? 'Automated security fixes enabled' : 'Automated security fixes disabled'); }
+    catch (e) { toast('Failed: ' + e.message); }
+  });
+  const ssw = $('#secSecretSw');
+  if (ssw) ssw.addEventListener('click', async () => {
+    const on = !ssw.classList.contains('on');
+    try { await api('/repos/' + full + '/secret-scanning', { method: 'PATCH', body: JSON.stringify({ state: on ? 'enabled' : 'disabled' }) }); ssw.classList.toggle('on', on); toast(on ? 'Secret scanning enabled' : 'Secret scanning disabled'); }
+    catch (e) { toast('Failed: ' + e.message); }
+  });
+}
+
+/* ---------- insights (pulse) ---------- */
+async function renderInsights(o, n) {
+  const seq = ++RSEQ;
+  const full = o + '/' + n;
+  view().innerHTML = spinner();
+  const [contribs, activity, events] = await Promise.all([
+    api('/repos/' + full + '/stats/contributors').catch(() => null),
+    api('/repos/' + full + '/stats/commit_activity').catch(() => null),
+    api('/repos/' + full + '/events?per_page=15').catch(() => [])
+  ]);
+  if (seq !== RSEQ) return;
+  let html = '';
+  if (Array.isArray(contribs) && contribs.length) {
+    const sorted = contribs.slice().sort((a, b) => (b.total || 0) - (a.total || 0));
+    const max = sorted[0].total || 1;
+    html += '<h2 class="sect">Top contributors</h2><div class="card list">';
+    sorted.slice(0, 12).forEach(c => {
+      html += '<div class="lrow" data-go="#/user/' + esc(c.author ? c.author.login : '') + '">' +
+        (c.author ? '<img class="cav" src="' + esc(c.author.avatar_url) + '" alt="">' : SVG.user) +
+        '<div class="lmain"><div class="ltitle">' + esc(c.author ? c.author.login : 'unknown') + '</div>' +
+        '<div class="cbar"><span style="width:' + Math.round(100 * (c.total || 0) / max) + '%"></span></div></div>' +
+        '<div class="lsub" style="align-self:center">' + nf(c.total || 0) + ' commits</div></div>';
+    });
+    html += '</div>';
+  } else if (contribs && !Array.isArray(contribs)) {
+    html += '<div class="card empty">GitHub is still calculating contributor statistics — check back in a minute.</div>';
+  } else {
+    html += '<div class="card empty">No contributor statistics yet.</div>';
+  }
+  if (Array.isArray(activity) && activity.length) {
+    const maxW = Math.max.apply(null, activity.map(w => w.total || 0)) || 1;
+    html += '<h2 class="sect">Commits per week (last year)</h2><div class="card"><div class="wkchart">' +
+      activity.map(w => '<div class="wkbar" style="height:' + Math.max(3, Math.round(64 * (w.total || 0) / maxW)) + 'px" title="' + (w.total || 0) + ' commits"></div>').join('') +
+      '</div><div class="lsub" style="margin-top:10px">' + nf(activity.reduce((s, w) => s + (w.total || 0), 0)) + ' commits in the last 52 weeks</div></div>';
+  }
+  if (Array.isArray(events) && events.length) {
+    html += '<h2 class="sect">Recent activity</h2><div class="card list">' + events.map(ev => eventRow(ev)).join('') + '</div>';
+  }
+  view().innerHTML = html || '<div class="card empty">No insights available for this repository.</div>';
+}
+
+/* ---------- deployments sheet ---------- */
+async function deploymentsSheet(full) {
+  openSheet('<div class="sheethead"><b>Deployments</b><button class="iconbtn" data-act="closesheet">' + SVG.x + '</button></div>' + spinner(true));
+  const head = '<div class="sheethead"><b>Deployments</b><button class="iconbtn" data-act="closesheet">' + SVG.x + '</button></div>';
+  try {
+    const deps = await api('/repos/' + full + '/deployments?per_page=15');
+    if (!deps.length) { const c = $('.sheetcard'); if (c) c.innerHTML = head + '<div class="lsub">No deployments yet. Deployments appear when workflows or services publish environments.</div>'; return; }
+    const statii = await Promise.all(deps.map(d => api('/repos/' + full + '/deployments/' + d.id + '/statuses?per_page=1').catch(() => [])));
+    let html = head;
+    deps.forEach((d, i) => {
+      const st = statii[i] && statii[i][0] ? statii[i][0].state : '';
+      const ok = st === 'success', bad = st === 'failure' || st === 'error';
+      html += '<div class="lrow" style="padding:10px 0"' + (d.environment_url ? ' data-act="ext" data-url="' + esc(d.environment_url) + '"' : '') + '>' +
+        '<div class="lmain"><div class="ltitle">' + esc(d.environment || 'deployment') + ' · ' + (d.sha ? d.sha.slice(0, 7) : '') + '</div>' +
+        '<div class="lsub">' + tAgo(d.created_at) + (d.ref ? ' · ref ' + esc(d.ref) : '') + '</div></div>' +
+        (st ? '<span class="chip ' + (ok ? 'ok' : (bad ? 'closed' : '')) + '">' + esc(st) + '</span>' : '') + '</div>';
+    });
+    const c = $('.sheetcard'); if (c) c.innerHTML = html;
+  } catch (e) { const c = $('.sheetcard'); if (c) c.innerHTML = head + errCard(e); }
+}
+
+/* ---------- repo settings: pages / environments / interaction limits / protection ---------- */
+async function loadPages(o, n) {
+  const el = $('#pagesCard'); if (!el) return;
+  const full = o + '/' + n;
+  let p = null;
+  try { p = await api('/repos/' + full + '/pages'); } catch (e) {}
+  if (!p) {
+    el.innerHTML = '<div class="ltitle" style="padding:2px 4px 4px;font-size:15px">GitHub Pages</div>' +
+      '<div class="lsub" style="margin-bottom:10px">Publish a website straight from this repository.</div>' +
+      '<label class="fldlabel">Branch</label><select class="fld" id="pgBranch"></select>' +
+      '<label class="fldlabel" style="margin-top:12px">Folder</label><select class="fld" id="pgFolder"><option value="/">/ (root)</option><option value="/docs">/docs</option></select>' +
+      '<button class="btn primary btnblock" id="pgPublish" style="margin-top:16px">Publish site</button>';
+    const branches = await api('/repos/' + full + '/branches?per_page=100').catch(() => []);
+    const sel = $('#pgBranch');
+    if (sel) sel.innerHTML = branches.map(b => '<option value="' + esc(b.name) + '">' + esc(b.name) + '</option>').join('') || '<option value="main">main</option>';
+    const pb = $('#pgPublish');
+    if (pb) pb.addEventListener('click', async () => {
+      pb.disabled = true;
+      try {
+        await api('/repos/' + full + '/pages', { method: 'POST', body: JSON.stringify({ source: { branch: $('#pgBranch').value, path: $('#pgFolder').value } }) });
+        toast('Site published'); loadPages(o, n);
+      } catch (e) { toast('Failed: ' + e.message); pb.disabled = false; }
+    });
+    return;
+  }
+  el.innerHTML = '<div class="ltitle" style="padding:2px 4px 4px;font-size:15px">GitHub Pages</div>' +
+    '<div class="lrow" data-act="ext" data-url="' + esc(p.html_url) + '" style="padding:10px 0"><div class="lmain">' +
+    '<div class="ltitle">' + esc(p.html_url) + '</div><div class="lsub">' + esc(p.status || '') + ' · tap to visit site</div></div></div>' +
+    '<label class="fldlabel">Build from branch</label><select class="fld" id="pgBranch"></select>' +
+    '<label class="fldlabel" style="margin-top:12px">Folder</label><select class="fld" id="pgFolder"><option value="/">/ (root)</option><option value="/docs">/docs</option></select>' +
+    '<button class="btn ghost btnblock" id="pgSave" style="margin-top:14px">Save source</button>' +
+    '<label class="fldlabel" style="margin-top:16px">Custom domain</label><input class="fld" id="pgDomain" value="' + esc(p.cname || '') + '" placeholder="example.com" autocomplete="off">' +
+    '<button class="btn ghost btnblock" id="pgDomainSave" style="margin-top:14px">Save domain</button>' +
+    '<div class="setrow" style="margin-top:14px"><div class="lmain"><div class="ltitle">Enforce HTTPS</div><div class="lsub">Encrypts traffic to your Pages site</div></div>' +
+    '<button class="switch' + (p.https_enforced ? ' on' : '') + '" id="pgHttpsSw" aria-label="enforce https"></button></div>' +
+    '<button class="btn danger btnblock" id="pgUnpublish" style="margin-top:16px">Unpublish site</button>';
+  const branches = await api('/repos/' + full + '/branches?per_page=100').catch(() => []);
+  const sel = $('#pgBranch');
+  if (sel) {
+    sel.innerHTML = branches.map(b => '<option value="' + esc(b.name) + '"' + (p.source && b.name === p.source.branch ? ' selected' : '') + '>' + esc(b.name) + '</option>').join('');
+    if (sel.options.length && sel.selectedIndex === -1 && p.source) { /* keep first */ }
+    const fld = $('#pgFolder'); if (fld && p.source && p.source.path) fld.value = p.source.path;
+  }
+  const sv = $('#pgSave');
+  if (sv) sv.addEventListener('click', async () => {
+    try { await api('/repos/' + full + '/pages', { method: 'PUT', body: JSON.stringify({ source: { branch: $('#pgBranch').value, path: $('#pgFolder').value } }) }); toast('Pages source saved'); }
+    catch (e) { toast('Failed: ' + e.message); }
+  });
+  const ds = $('#pgDomainSave');
+  if (ds) ds.addEventListener('click', async () => {
+    const v = $('#pgDomain').value.trim();
+    try { await api('/repos/' + full + '/pages', { method: 'PUT', body: JSON.stringify(v ? { cname: v } : { cname: null }) }); toast('Domain saved'); }
+    catch (e) { toast('Failed: ' + e.message); }
+  });
+  const hs = $('#pgHttpsSw');
+  if (hs) hs.addEventListener('click', async () => {
+    const on = !hs.classList.contains('on');
+    try { await api('/repos/' + full + '/pages', { method: 'PUT', body: JSON.stringify({ https_enforced: on }) }); hs.classList.toggle('on', on); toast(on ? 'HTTPS enforced' : 'HTTPS not enforced'); }
+    catch (e) { toast('Failed: ' + e.message); }
+  });
+  const up = $('#pgUnpublish');
+  if (up) up.addEventListener('click', async () => {
+    if (!window.confirm('Unpublish the Pages site?')) return;
+    try { await api('/repos/' + full + '/pages', { method: 'DELETE' }); toast('Site unpublished'); loadPages(o, n); }
+    catch (e) { toast('Failed: ' + e.message); }
+  });
+}
+async function loadEnvs(o, n) {
+  const el = $('#rsEnvList'); if (!el) return;
+  const full = o + '/' + n;
+  try {
+    const res = await api('/repos/' + full + '/environments?per_page=30');
+    const envs = (res && res.environments) || [];
+    el.innerHTML = envs.length ? envs.map(e =>
+      '<div class="lrow" style="padding:10px 0"><div class="lmain"><div class="ltitle">' + esc(e.name) + '</div>' +
+      '<div class="lsub">' + ((e.protection_rules || []).length ? (e.protection_rules.length + ' protection rule' + (e.protection_rules.length > 1 ? 's' : '')) : 'no protection rules') + '</div></div>' +
+      '<button class="iconbtn" data-rmenv="' + esc(e.name) + '" aria-label="delete environment">' + SVG.x + '</button></div>').join('') :
+      '<div class="lsub" style="padding:10px 0">No environments yet.</div>';
+    el.querySelectorAll('[data-rmenv]').forEach(b => b.addEventListener('click', async () => {
+      if (!window.confirm('Delete environment ' + b.dataset.rmenv + '?')) return;
+      try { await api('/repos/' + full + '/environments/' + encodeURIComponent(b.dataset.rmenv), { method: 'DELETE' }); toast('Environment deleted'); loadEnvs(o, n); }
+      catch (e) { toast('Failed: ' + e.message); }
+    }));
+  } catch (e) { el.innerHTML = '<div class="lsub" style="padding:10px 0">Could not load environments: ' + esc(e.message) + '</div>'; }
+}
+async function loadIL(o, n) {
+  const el = $('#ilCard'); if (!el) return;
+  const full = o + '/' + n;
+  const r = await api('/repos/' + full + '/interaction-limits', { status: true }).catch(() => null);
+  const cur = (r && r.status === 200 && r.data) ? r.data : null;
+  const opts = [['', 'No limit — anyone can interact'], ['existing_users', 'Existing users only'], ['contributors_only', 'Prior contributors only'], ['collaborators_only', 'Collaborators only']];
+  const exps = [['one_day', '1 day'], ['three_days', '3 days'], ['one_week', '1 week'], ['one_month', '1 month'], ['six_months', '6 months']];
+  el.innerHTML = '<div class="ltitle" style="padding:2px 4px 4px;font-size:15px">Interaction limits</div>' +
+    '<div class="lsub" style="margin-bottom:10px">Temporarily restrict which users can comment, open issues or create pull requests here.</div>' +
+    '<label class="fldlabel">Limit</label><select class="fld" id="ilLimit">' +
+    opts.map(x => '<option value="' + x[0] + '"' + (cur && cur.limit === x[0] ? ' selected' : '') + '>' + x[1] + '</option>').join('') + '</select>' +
+    '<label class="fldlabel" style="margin-top:12px">Expires after</label><select class="fld" id="ilExpiry">' +
+    exps.map(x => '<option value="' + x[0] + '"' + (cur && cur.expiry === x[0] ? ' selected' : '') + '>' + x[1] + '</option>').join('') + '</select>' +
+    '<button class="btn primary btnblock" id="ilSave" style="margin-top:16px">Apply limit</button>' +
+    '<button class="btn danger btnblock" id="ilRemove" style="margin-top:8px">Remove limit</button>';
+  $('#ilSave').addEventListener('click', async () => {
+    const v = $('#ilLimit').value;
+    if (!v) { toast('Pick a limit type first'); return; }
+    try { await api('/repos/' + full + '/interaction-limits', { method: 'PUT', body: JSON.stringify({ limit: v, expiry: $('#ilExpiry').value }) }); toast('Interaction limit applied'); }
+    catch (e) { toast('Failed: ' + e.message); }
+  });
+  $('#ilRemove').addEventListener('click', async () => {
+    try { await api('/repos/' + full + '/interaction-limits', { method: 'DELETE' }); toast('Interaction limit removed'); loadIL(o, n); }
+    catch (e) { toast('Failed: ' + e.message); }
+  });
+}
+function protectionSheet(o, n, branch) {
+  const full = o + '/' + n;
+  openSheet('<div class="sheethead"><b>Protect ' + esc(branch) + '</b><button class="iconbtn" data-act="closesheet">' + SVG.x + '</button></div>' + spinner(true));
+  api('/repos/' + full + '/branches/' + encodeURIComponent(branch) + '/protection', { status: true }).then(r => {
+    const p = (r && r.status === 200 && r.data) ? r.data : null;
+    const rr = p && p.required_pull_request_reviews;
+    const sc = p && p.required_status_checks;
+    const cnt = (rr && typeof rr.required_approving_review_count === 'number') ? rr.required_approving_review_count : 1;
+    const c = $('.sheetcard'); if (!c) return;
+    c.innerHTML = '<div class="sheethead"><b>Protect ' + esc(branch) + '</b><button class="iconbtn" data-act="closesheet">' + SVG.x + '</button></div>' +
+      '<div class="setrow"><div class="lmain"><div class="ltitle">Require pull request reviews</div><div class="lsub">Before merging, at least the number of approvals below</div></div>' +
+      '<button class="switch' + (rr ? ' on' : '') + '" id="bpRev" aria-label="require reviews"></button></div>' +
+      '<label class="fldlabel" style="margin-top:12px">Required approvals</label><input class="fld" id="bpCnt" type="number" min="0" max="6" value="' + cnt + '">' +
+      '<div class="setrow" style="margin-top:14px"><div class="lmain"><div class="ltitle">Require status checks</div><div class="lsub">Block merging while required checks are failing</div></div>' +
+      '<button class="switch' + (sc ? ' on' : '') + '" id="bpSc" aria-label="require checks"></button></div>' +
+      '<div class="setrow" style="margin-top:14px"><div class="lmain"><div class="ltitle">Include administrators</div><div class="lsub">Admins must follow the same rules</div></div>' +
+      '<button class="switch' + (p && p.enforce_admins && p.enforce_admins.enabled ? ' on' : '') + '" id="bpAdm" aria-label="enforce admins"></button></div>' +
+      '<div class="setrow" style="margin-top:14px"><div class="lmain"><div class="ltitle">Allow force pushes</div><div class="lsub">Permit history rewrites on this branch</div></div>' +
+      '<button class="switch' + (p && p.allow_force_pushes && p.allow_force_pushes.enabled ? ' on' : '') + '" id="bpFp" aria-label="force pushes"></button></div>' +
+      '<div class="setrow" style="margin-top:14px"><div class="lmain"><div class="ltitle">Allow deletions</div><div class="lsub">Let this branch be deleted</div></div>' +
+      '<button class="switch' + (p && p.allow_deletions && p.allow_deletions.enabled ? ' on' : '') + '" id="bpDel" aria-label="allow deletions"></button></div>' +
+      '<button class="btn primary btnblock" id="bpSave" style="margin-top:16px">Save protection</button>' +
+      '<button class="btn danger btnblock" id="bpRemove" style="margin-top:8px">Remove protection</button>';
+    const gv = k => { const s = $('#' + k); return s && s.classList.contains('on'); };
+    $('#bpSave').addEventListener('click', async () => {
+      const body = {
+        required_status_checks: gv('bpSc') ? { strict: false, contexts: [] } : null,
+        enforce_admins: gv('bpAdm') ? true : false,
+        required_pull_request_reviews: gv('bpRev') ? { dismiss_stale_reviews: false, require_code_owner_reviews: false, required_approving_review_count: Math.max(0, Math.min(6, parseInt($('#bpCnt').value || '1', 10) || 1)) } : null,
+        restrictions: null,
+        allow_force_pushes: gv('bpFp') ? true : false,
+        allow_deletions: gv('bpDel') ? true : false
+      };
+      try { await api('/repos/' + full + '/branches/' + encodeURIComponent(branch) + '/protection', { method: 'PUT', body: JSON.stringify(body) }); toast('Protection saved for ' + branch); closeSheet(); }
+      catch (e) { toast('Failed: ' + e.message); }
+    });
+    $('#bpRemove').addEventListener('click', async () => {
+      if (!window.confirm('Remove branch protection from ' + branch + '?')) return;
+      try { await api('/repos/' + full + '/branches/' + encodeURIComponent(branch) + '/protection', { method: 'DELETE' }); toast('Protection removed'); closeSheet(); }
+      catch (e) { toast('Failed: ' + e.message); }
+    });
+  }).catch(e => { const c = $('.sheetcard'); if (c) c.innerHTML = '<div class="sheethead"><b>Protect ' + esc(branch) + '</b><button class="iconbtn" data-act="closesheet">' + SVG.x + '</button></div>' + errCard(e); });
+}
+function transferSheet(o, n) {
+  openSheet('<div class="sheethead"><b>Transfer repository</b><button class="iconbtn" data-act="closesheet">' + SVG.x + '</button></div>' +
+    '<div class="lsub">Moves this repository to another user or organization where you can create repositories.</div>' +
+    '<label class="fldlabel" style="margin-top:12px">New owner</label><input class="fld" id="tfOwner" placeholder="username or organization" autocomplete="off" spellcheck="false">' +
+    '<button class="btn danger btnblock" id="tfGo" style="margin-top:16px">Transfer ' + esc(o + '/' + n) + '</button>');
+  $('#tfGo').addEventListener('click', async () => {
+    const own = $('#tfOwner').value.trim();
+    if (!own) { toast('Enter the new owner'); return; }
+    if (!window.confirm('Transfer ' + o + '/' + n + ' to ' + own + '?')) return;
+    $('#tfGo').disabled = true;
+    try {
+      const r = await api('/repos/' + o + '/' + n + '/transfer', { method: 'POST', body: JSON.stringify({ new_owner: own }) });
+      closeSheet(); toast('Transferred to ' + own);
+      location.hash = '#/repo/' + own + '/' + ((r && r.name) ? r.name : n);
+    } catch (e) { toast('Failed: ' + e.message); $('#tfGo').disabled = false; }
+  });
+}
+
+/* ---------- account: SSH keys, GPG keys, organizations ---------- */
+/* ---------- watched repositories (notification sources, managed in-app) ---------- */

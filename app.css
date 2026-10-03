@@ -13,7 +13,7 @@
 .daybar i{font-style:normal;font-size:10.5px;color:var(--text2)}
 .heatwrap{display:flex;gap:3px;overflow-x:auto;padding:6px 0}
 .heatcol{display:flex;flex-direction:column;gap:3px}
-.heatcell{width:11px;height:11px;border-radius:3px;background:var(--chip);flex-shrink:0}
+.heatcell{width:11px;height:11px;border-radius:2px;background:var(--chip);flex-shrink:0}
 .heatcell.l1{background:var(--accent);opacity:.4}
 .heatcell.l2{background:var(--accent);opacity:.6}
 .heatcell.l3{background:var(--accent);opacity:.8}
@@ -419,3 +419,124 @@ body.dark #upProgCard,body.pitch #upProgCard{box-shadow:0 14px 44px rgba(0,0,0,.
 .upbar{height:6px;border-radius:3px;background:var(--chip);overflow:hidden;margin-top:10px}
 .upbar i{display:block;height:100%;background:var(--accent);border-radius:3px;transition:width .25s}
 .filehead[data-go]{cursor:pointer}
+
+/* ================= v2.78: PRs, actions, security, insights, a11y ================= */
+.seg.tabs{flex-wrap:nowrap;overflow-x:auto;-webkit-overflow-scrolling:touch;scrollbar-width:none}
+.seg.tabs::-webkit-scrollbar{display:none}
+.seg.tabs .segb{flex:1 0 auto;min-width:88px;padding:0 14px;white-space:nowrap}
+.istate.merged{background:rgba(139,92,246,.15);color:#8B5CF6}
+.runstate{width:34px;height:34px;border-radius:50%;display:flex;align-items:center;justify-content:center;flex-shrink:0}
+.runstate.ok{background:rgba(18,183,106,.15);color:#12B76A}
+.runstate.bad{background:rgba(239,68,68,.15);color:#EF4444}
+.runstate.run{background:rgba(245,158,11,.15);color:#F59E0B}
+.runstate.mute{background:var(--seg);color:var(--text2)}
+.runstate svg{width:16px;height:16px}
+.steps{margin-top:8px;display:flex;flex-direction:column;gap:4px}
+.step{display:flex;gap:8px;font-size:12.5px;color:var(--text2)}
+.wkchart{display:flex;align-items:flex-end;gap:2px;height:64px;margin-top:14px}
+.wkbar{flex:1;background:var(--accent);border-radius:2px;min-height:2px;opacity:.85}
+.cbar{height:6px;border-radius:3px;background:var(--seg);overflow:hidden;margin-top:6px;min-width:70px}
+.cbar span{display:block;height:100%;background:var(--accent);border-radius:3px}
+body.reducemotion *{animation:none!important;transition:none!important}
+body.showunderline .md a, body.showunderline .card.md a{text-decoration:underline}
+
+/* v2.79: wrapping secondary text for messages inside sheets */
+.lsubwrap{white-space:normal!important;overflow:visible!important;text-overflow:initial!important;overflow-wrap:anywhere;line-height:1.55}
+
+/* v2.84: fallback link shown when a README image cannot be loaded at all */
+.imgfallback{display:inline-flex;align-items:center;gap:8px;padding:10px 14px;margin:4px 0;border-radius:14px;background:var(--seg);color:var(--accent);font-size:13px;font-weight:600;text-decoration:none;overflow-wrap:anywhere}
+
+/* v2.92: GitHub's Activity overview radar chart */
+.radar{width:100%;height:auto;display:block;max-height:260px}
+.radaraxis{stroke:var(--divider);stroke-width:1}
+.radararea{fill:rgba(18,183,106,.18);stroke:#12B76A;stroke-width:2;stroke-linejoin:round}
+.radarlabel{fill:var(--text2);font-size:11px;font-weight:600}
+.radarlabel.end{text-anchor:end}
+.radarlabel.mid{text-anchor:middle}
+
+/* ================= v3.02: desktop & laptop layout =================
+   Nothing below 760px changes, so the phone layout is untouched. Wider
+   screens get a centred content column, dialogs instead of bottom sheets,
+   a permanent navigation rail, hover feedback and finer scrollbars. */
+
+/* ---------- tablet / small laptop ---------- */
+@media (min-width: 760px) {
+  #pagehead { max-width: 920px; margin: 0 auto; padding: 22px 26px 14px; }
+  #view { max-width: 920px; margin: 0 auto; padding: 10px 26px 120px; }
+  #appbar { padding: 0 26px; }
+  #appbarTitle { flex: 1; }
+  #bigTitle { font-size: 36px; }
+  .card { padding: 24px; }
+  .searchbar { max-width: 920px; margin: 4px auto 12px; }
+  .heatwrap { justify-content: center; }
+  .heatcell { width: 13px; height: 13px; }
+  .seg { max-width: 920px; }
+  .bigstats { gap: 14px; }
+  .pstats { gap: 12px; }
+  /* bottom sheets become centred dialogs */
+  #sheet { align-items: center; justify-content: center; padding: 28px; }
+  .sheetcard { max-width: 580px; border-radius: 32px; max-height: 82vh; padding: 20px 22px 26px; }
+  .sheethead { padding: 4px 6px 14px; }
+  .sheethead b { font-size: 16px; }
+  .filepre { max-height: 56vh; }
+  #toasts { bottom: 40px; }
+}
+
+/* ---------- desktop / laptop ---------- */
+@media (min-width: 1080px) {
+  /* the floating pill becomes a permanent left rail */
+  #navbar {
+    top: 0; bottom: 0; left: 0; right: auto; width: 100px;
+    flex-direction: column; justify-content: center; gap: 8px;
+    padding: 16px 12px; border-radius: 0 30px 30px 0;
+    background: var(--card);
+    -webkit-backdrop-filter: none; backdrop-filter: none;
+    border: none; border-right: 1px solid var(--divider);
+    box-shadow: none;
+  }
+  #navbar.hide { transform: none; opacity: 1; pointer-events: auto; }
+  .navbtn { flex: 0 0 auto; width: 76px; min-height: 64px; border-radius: 20px; font-size: 11px; }
+  .navbtn.active { box-shadow: 0 6px 18px var(--glow); }
+  #scroller { padding-left: 100px; }
+  #appbar { padding-left: 126px; }
+  #pagehead, #view { max-width: 1140px; }
+  #view { padding-bottom: 56px; }
+  #toasts { bottom: 28px; }
+  /* repository cards lay out two-up */
+  .repogrid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; align-items: start; }
+  .repogrid .card { margin: 0; }
+  .bigstats { flex-wrap: wrap; }
+  .bstat { min-width: 130px; }
+  .radar { max-height: 320px; }
+  .daybars { max-width: 720px; margin: 0 auto; }
+}
+
+@media (min-width: 1400px) {
+  #pagehead, #view { max-width: 1280px; }
+  .repogrid { grid-template-columns: 1fr 1fr 1fr; }
+}
+
+/* ---------- mouse / trackpad ---------- */
+@media (hover: hover) and (pointer: fine) {
+  button, a, .lrow, .card[data-go], .person, .navbtn { cursor: pointer; }
+  .card:hover { transform: translateY(-1px); box-shadow: 0 8px 26px rgba(0,0,0,.10); }
+  body.dark .card:hover, body.pitch .card:hover { box-shadow: 0 8px 26px rgba(0,0,0,.5); }
+  .lrow:hover { background: var(--chip); }
+  .btn:hover { box-shadow: 0 6px 22px var(--glow); }
+  .btn.ghost:hover, .btn.danger:hover { background: var(--chip); }
+  .iconbtn:hover { background: var(--chip); }
+  .segb:hover { color: var(--text); }
+  .navbtn:hover { background: var(--chip); color: var(--text); }
+  .accentdot:hover { transform: scale(1.06); }
+  .pinbtn:hover { color: var(--accent); }
+  .morebtn:hover { box-shadow: 0 6px 22px var(--glow); }
+  .person:hover img { transform: scale(1.04); box-shadow: 0 0 16px var(--glow); }
+  #scroller { scrollbar-width: thin; scrollbar-color: var(--divider) transparent; }
+  #scroller::-webkit-scrollbar { width: 10px; }
+  #scroller::-webkit-scrollbar-track { background: transparent; }
+  #scroller::-webkit-scrollbar-thumb { background: var(--divider); border-radius: 8px; border: 3px solid var(--bg); }
+  #scroller::-webkit-scrollbar-thumb:hover { background: var(--text2); }
+  .sheetcard { scrollbar-width: thin; }
+  .sheetcard::-webkit-scrollbar { width: 8px; }
+  .sheetcard::-webkit-scrollbar-thumb { background: var(--divider); border-radius: 8px; }
+}
