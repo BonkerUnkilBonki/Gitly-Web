@@ -1,0 +1,4208 @@
+'use strict';
+
+/* ================= storage & state ================= */
+const LS = {
+  get(k, d) { try { const v = localStorage.getItem('onegit.' + k); return v === null ? d : JSON.parse(v); } catch (e) { return d; } },
+  set(k, v) { try { localStorage.setItem('onegit.' + k, JSON.stringify(v)); } catch (e) {} },
+  del(k) { try { localStorage.removeItem('onegit.' + k); } catch (e) {} }
+};
+let TOKEN = LS.get('token', null);
+let TOKEN_SCOPES = LS.get('tokenScopes', null);
+/* what kind of credential is the current account signed in with */
+function loginMethod() {
+  const t = TOKEN || '';
+  if (t.startsWith('github_pat_')) return 'fine';
+  if (t.startsWith('gho_')) return 'oauth';
+  if (t.startsWith('ghp_')) return 'classic';
+  if (t.startsWith('ghu_')) return 'app';
+  return 'token';
+}
+function loginMethodLabel() {
+  switch (loginMethod()) {
+    case 'fine': return 'Fine-grained personal access token (github_pat_)';
+    case 'classic': return 'Personal access token, classic (ghp_)';
+    case 'oauth': return 'GitHub sign-in, device flow';
+    case 'app': return 'GitHub App user token';
+    default: return 'Personal access token';
+  }
+}
+let RSEQ = 0;
+let lastOfflineToast = 0;
+const API_MEM = {};
+/* real version from the installed package (never goes stale when rebuilding);
+   the constant is only a fallback for very old builds without the bridge */
+const APPV = (window.OneGit && window.OneGit.appVersion ? String(window.OneGit.appVersion() || '') : '') || '3.02';
+const UPD_REPO = 'BonkerUnkilBonki/Gitly-Update';
+/* when this app was installed/updated - ANY release published after this
+   moment counts as an update, no version parsing at all */
+const INSTALLED_AT = (window.OneGit && window.OneGit.appInstallTime ? Number(window.OneGit.appInstallTime() || 0) : 0);
+/* pulls a version number out of a release - tags like v2.60, names like
+   "vStable 2.60" or plain "V2.60" all yield 2.60; tag-only words like
+   "vStable" fall back to the release name */
+function releaseVersion(rel) {
+  const src = [rel && rel.tag_name, rel && rel.name].filter(Boolean).join(' ');
+  const m = String(src).match(/(\d+(?:\.\d+)*)/);
+  return m ? m[1] : '';
+}
+let USER = null;
+let pins = LS.get('pins', []);
+let gistId = LS.get('gistId', null);
+let syncTimer = null;
+const repoCache = new Map();
+
+/* ================= helpers ================= */
+const $ = s => document.querySelector(s);
+const $$ = s => Array.from(document.querySelectorAll(s));
+function esc(s) {
+  return (s == null ? '' : String(s)).replace(/[&<>"']/g, c => '&' + '#' + c.charCodeAt(0) + ';');
+}
+function nf(n) { n = n | 0; if (n >= 1e6) return (n / 1e6).toFixed(1).replace(/\.0$/, '') + 'm'; if (n >= 1e3) return (n / 1e3).toFixed(n >= 1e4 ? 0 : 1).replace(/\.0$/, '') + 'k'; return String(n); }
+function tAgo(iso) { if (!iso) return ''; const s = (Date.now() - new Date(iso).getTime()) / 1000; if (s < 60) return 'just now'; if (s < 3600) return Math.floor(s / 60) + 'm ago'; if (s < 86400) return Math.floor(s / 3600) + 'h ago'; if (s < 2592e3) return Math.floor(s / 86400) + 'd ago'; if (s < 31536e3) return Math.floor(s / 2592e3) + 'mo ago'; return Math.floor(s / 31536e3) + 'y ago'; }
+function fmtSize(b) { if (b == null || b === '') return ''; if (b < 1024) return b + ' B'; if (b < 1048576) return (b / 1024).toFixed(1) + ' KB'; return (b / 1048576).toFixed(1) + ' MB'; }
+function toast(msg) { const t = document.createElement('div'); t.className = 'toast'; t.textContent = msg; $('#toasts').appendChild(t); requestAnimationFrame(() => t.classList.add('show')); setTimeout(() => { t.classList.remove('show'); setTimeout(() => t.remove(), 300); }, 2600); }
+function spinner(sm) { return '<div class="spinwrap' + (sm ? ' sm' : '') + '"><div class="spinner"></div></div>'; }
+function errCard(e) { return '<div class="card empty">' + esc((e && e.message) || 'Something went wrong') + '</div>'; }
+function isoDaysAgo(d) { const dt = new Date(Date.now() - d * 864e5); return dt.toISOString().slice(0, 10); }
+
+const LANG = { JavaScript: '#f1e05a', TypeScript: '#3178c6', Python: '#3572A5', Java: '#b07219', Kotlin: '#A97BFF', C: '#555555', 'C++': '#f34b7d', 'C#': '#178600', Go: '#00ADD8', Rust: '#dea584', Ruby: '#701516', Swift: '#F05138', Dart: '#00B4AB', PHP: '#4F5D95', HTML: '#e34c26', CSS: '#563d7c', Shell: '#89e051', Vue: '#41b883' };
+function langColor(l) { return LANG[l] || '#8a8a8a'; }
+
+const SVG = {
+  star: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>',
+  fork: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></svg>',
+  search: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>',
+  folder: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>',
+  file: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>',
+  check: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>',
+  x: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>',
+  pen: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="18" height="18"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/></svg>',
+  dot: '<svg viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="12" r="5"/></svg>',
+  commit: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3.5"/><line x1="1" y1="12" x2="8.5" y2="12"/><line x1="15.5" y1="12" x2="23" y2="12"/></svg>',
+  plus: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>',
+  pr: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="18" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><path d="M13 6h3a2 2 0 0 1 2 2v7"/><line x1="6" y1="9" x2="6" y2="21"/></svg>',
+  tag: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.83z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg>',
+  comment: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>',
+  user: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>',
+  eye: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>',
+  ext: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>',
+  code: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="8 5 3 12 8 19"/><polyline points="16 5 21 12 16 19"/></svg>',
+  copy: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>',
+  dl: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>',
+  telegram: '<svg viewBox="0 0 24 24" fill="#229ED9" width="20" height="20"><path d="M11.944 0A12 12 0 0 0 0 12a12 12 0 0 0 12 12 12 12 0 0 0 12-12A12 12 0 0 0 12 0a12 12 0 0 0-.056 0zm4.962 7.224c.1-.002.321.023.465.14a.506.506 0 0 1 .171.325c.016.093.036.306.02.472-.18 1.898-.962 6.502-1.36 8.627-.168.9-.499 1.201-.82 1.23-.696.065-1.225-.46-1.9-.902-1.056-.693-1.653-1.124-2.678-1.8-1.185-.78-.417-1.21.258-1.91.177-.184 3.247-2.977 3.307-3.23.007-.032.014-.15-.056-.212s-.174-.041-.249-.024c-.106.024-1.793 1.14-5.061 3.345-.48.33-.913.49-1.302.48-.428-.008-1.252-.241-1.865-.44-.752-.245-1.349-.374-1.297-.789.027-.216.325-.437.893-.663 3.498-1.524 5.83-2.529 6.998-3.014 3.332-1.386 4.025-1.627 4.476-1.635z"/></svg>',
+  github: '<svg viewBox="0 0 24 24" fill="currentColor" width="20" height="20"><path d="M12 .297c-6.63 0-12 5.373-12 12 0 5.303 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61C4.422 18.07 3.633 17.7 3.633 17.7c-1.087-.744.084-.729.084-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 22.092 24 17.592 24 12.297c0-6.627-5.373-12-12-12"/></svg>',
+  bell: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>'
+};
+
+/* ================= api ================= */
+async function api(path, opts = {}) {
+  const headers = { 'Accept': 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28' };
+  if (TOKEN) headers.Authorization = 'Bearer ' + TOKEN;
+  if (opts.accept) headers.Accept = opts.accept;
+  if (opts.body) headers['Content-Type'] = 'application/json';
+  if (opts.noAuth) { delete headers.Authorization; }
+  const isGet = !opts.method || opts.method === 'GET';
+  const canCache = isGet && !opts.status;
+  let res;
+  try {
+    res = await fetch('https://api.github.com' + path, { method: opts.method || 'GET', headers, body: opts.body || undefined, cache: 'no-store' });
+  } catch (netErr) {
+    if (canCache) {
+      const c = LS.get('c:' + path, null);
+      if (c && (c.raw ? typeof c.d === 'string' : c.d !== undefined)) {
+        if (Date.now() - (lastOfflineToast || 0) > 30000) { lastOfflineToast = Date.now(); try { toast('Offline — showing saved data'); } catch (e) {} }
+        return c.d;
+      }
+    }
+    throw netErr;
+  }
+  /* remember which scopes the current token actually has (header is present
+     on classic PATs and OAuth tokens; fine-grained tokens return an empty list) */
+  try { const sc = res.headers.get('X-OAuth-Scopes'); if (typeof sc === 'string') { TOKEN_SCOPES = sc; LS.set('tokenScopes', sc); } } catch (e) {}
+  if (res.status === 401) { if (USER) doLogout('Session expired — sign in again'); throw new Error('Invalid or expired token'); }
+  if (opts.status) { const d = await res.json().catch(() => null); return { status: res.status, ok: res.ok, data: d }; }
+  if (res.status === 204) return null;
+  if (opts.text) { const t = await res.text(); if (!res.ok) throw new Error('HTTP ' + res.status); if (canCache) { const k = 'c:' + path; if (API_MEM[k] !== t) { API_MEM[k] = t; try { LS.set(k, { raw: 1, d: t }); } catch (e) {} } } return t; }
+  let data = null; try { data = await res.json(); } catch (e) {}
+  if (!res.ok) {
+    let m = (data && data.message) || ('HTTP ' + res.status);
+    if (data && Array.isArray(data.errors) && data.errors.length) {
+      const extra = data.errors.map(x => x && x.message).filter(Boolean).join('; ');
+      if (extra) m += ' — ' + extra;
+    }
+    throw new Error(m);
+  }
+  if (canCache && data !== null && data !== undefined) { const k = 'c:' + path, s = JSON.stringify(data); if (API_MEM[k] !== s) { API_MEM[k] = s; try { LS.set(k, { d: data }); } catch (e) {} } }
+  return data;
+}
+
+/* instant cache read for paint-first rendering */
+function cached(path) { try { const c = LS.get('c:' + path, null); if (c && (c.raw ? typeof c.d === 'string' : c.d !== undefined)) return c.d; } catch (e) {} return undefined; }
+
+/* ================= theme (mode + accent + glow) ================= */
+function shadeHex(hex, f) {
+  const p = i => Math.max(0, Math.min(255, Math.round(parseInt(hex.slice(1 + 2 * i, 3 + 2 * i), 16) * (1 + f))));
+  return '#' + [p(0), p(1), p(2)].map(v => v.toString(16).padStart(2, '0')).join('');
+}
+function applyTheme() {
+  const t = LS.get('theme', 'light');
+  document.body.classList.remove('dark', 'pitch');
+  if (t === 'dark') document.body.classList.add('dark');
+  else if (t === 'pitch') document.body.classList.add('pitch');
+  const rt = document.documentElement;
+  document.body.classList.toggle('navglow', !!LS.get('navglow', false));
+  const acc = LS.get('accent', 'blue');
+  rt.dataset.accent = acc;
+  rt.dataset.glow = LS.get('glow', true) ? 'on' : 'off';
+  rt.style.removeProperty('--accent');
+  rt.style.removeProperty('--accentD');
+  rt.style.removeProperty('--glow');
+  if (acc === 'dynamic' || acc === 'custom') {
+    let hex = '';
+    if (acc === 'dynamic') {
+      try { if (window.OneGit && window.OneGit.systemAccent) hex = window.OneGit.systemAccent() || ''; } catch (e) {}
+    } else {
+      hex = (LS.get('customAccent', '') || '').toUpperCase();
+    }
+    if (/^#[0-9A-F]{6}$/.test(hex)) {
+      rt.style.setProperty('--accent', hex.toUpperCase());
+      rt.style.setProperty('--accentD', shadeHex(hex.toUpperCase(), -0.25));
+      rt.style.setProperty('--glow', hex.toUpperCase() + '6B');
+    }
+  }
+  try {
+    if (window.OneGit && window.OneGit.theme) {
+      window.OneGit.theme(t === 'light' ? '#F2F2F2' : (t === 'dark' ? '#161719' : '#000000'), t === 'light');
+    }
+  } catch (e) {}
+  let accHex = '';
+  try { accHex = getComputedStyle(rt).getPropertyValue('--accent').trim(); } catch (e) {}
+  if (/^#[0-9A-Fa-f]{6}$/.test(accHex)) {
+    /* keep the home screen widgets in the same colour as the app */
+    try { if (window.OneGit && OneGit.widgetAccent) OneGit.widgetAccent(accHex.toUpperCase()); } catch (e) {}
+    const ch = v => { const c = parseInt(v, 16) / 255; return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4); };
+    const L = 0.2126 * ch(accHex.slice(1, 3)) + 0.7152 * ch(accHex.slice(3, 5)) + 0.0722 * ch(accHex.slice(5, 7));
+    rt.style.setProperty('--accentText', L > 0.45 ? '#151515' : '#fff');
+  } else {
+    rt.style.setProperty('--accentText', '#fff');
+  }
+}
+
+/* ================= font (bundled app font everywhere) ================= */
+function applyFont() { document.body.style.fontFamily = "'OneGitSans', system-ui, sans-serif"; }
+
+/* ================= pins ================= */
+function isPinned(full) { return pins.some(p => p.full_name === full); }
+function togglePin(r) {
+  const full = r.full_name || ((r.owner ? r.owner.login + '/' : '') + r.name);
+  if (isPinned(full)) { pins = pins.filter(p => p.full_name !== full); toast('Unpinned ' + r.name); }
+  else {
+    pins.push({ full_name: full, name: r.name, description: r.description, html_url: r.html_url, stargazers_count: r.stargazers_count, forks_count: r.forks_count, language: r.language });
+    toast('Pinned ' + r.name);
+  }
+  LS.set('pins', pins); queueSync();
+  $$('[data-pinbtn]').forEach(b => {
+    if (b.dataset.pinbtn === full) {
+      b.classList.toggle('pinned', isPinned(full));
+      b.classList.remove('pop'); void b.offsetWidth; b.classList.add('pop');
+    }
+  });
+}
+
+/* ================= sync (private Gist) ================= */
+function queueSync() { clearTimeout(syncTimer); syncTimer = setTimeout(() => syncPush(true), 1500); }
+async function syncPush(silent) {
+  if (!TOKEN) return;
+  const payload = { app: 'onegit', version: 1, updated_at: new Date().toISOString(), pins, theme: LS.get('theme', 'light'), accent: LS.get('accent', 'blue'), customAccent: LS.get('customAccent', ''), glow: LS.get('glow', true), navglow: LS.get('navglow', false), autodl: LS.get('autodl', false), font: LS.get('font', 'system'), notify: LS.get('notify', true) };
+  try {
+    const files = { 'onegit-sync.json': { content: JSON.stringify(payload, null, 2) } };
+    if (!gistId) {
+      const g = await api('/gists', { method: 'POST', body: JSON.stringify({ description: 'Gitly sync file (auto-generated) — do not delete', public: false, files }) });
+      gistId = g.id; LS.set('gistId', gistId); saveGistToAccount();
+    } else {
+      await api('/gists/' + gistId, { method: 'PATCH', body: JSON.stringify({ files }) });
+    }
+    if (!silent) toast('Synced to your private Gist');
+  } catch (e) { if (!silent) toast('Sync failed: ' + e.message); }
+}
+async function syncRestore(silent) {
+  if (!TOKEN) return false;
+  try {
+    let g = null;
+    if (gistId) { try { g = await api('/gists/' + gistId); } catch (e) {} }
+    if (!g) {
+      const list = await api('/gists?per_page=100');
+      g = list.find(x => x.files && x.files['onegit-sync.json']);
+      if (g) { gistId = g.id; LS.set('gistId', gistId); saveGistToAccount(); }
+    }
+    if (!g || !g.files['onegit-sync.json']) { if (!silent) toast('No sync data found on GitHub'); return false; }
+    const d = JSON.parse(g.files['onegit-sync.json'].content);
+    if (Array.isArray(d.pins)) { pins = d.pins; LS.set('pins', pins); }
+    if (d.theme) { LS.set('theme', d.theme); applyTheme(); }
+    if (d.accent) { LS.set('accent', d.accent); applyTheme(); }
+    if (d.customAccent) { LS.set('customAccent', d.customAccent); applyTheme(); }
+    if (d.font) { LS.set('font', 'default'); applyFont(); }
+    if (typeof d.glow === 'boolean') { LS.set('glow', d.glow); applyTheme(); }
+    if (typeof d.navglow === 'boolean') { LS.set('navglow', d.navglow); applyTheme(); }
+    if (typeof d.notify === 'boolean') LS.set('notify', d.notify);
+    if (typeof d.autodl === 'boolean') LS.set('autodl', d.autodl);
+    if (!silent) toast('Restored from your private Gist');
+    return true;
+  } catch (e) { if (!silent) toast('Restore failed: ' + e.message); return false; }
+}
+
+/* ================= app update (GitHub releases) ================= */
+let UPD_CHECKED = false;
+function newerVersion(a, b) {
+  const pa = String(a).replace(/^v/, '').split('.'), pb = String(b).replace(/^v/, '').split('.');
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const x = parseInt(pa[i] || 0, 10), y = parseInt(pb[i] || 0, 10);
+    if (x > y) return true;
+    if (x < y) return false;
+  }
+  return false;
+}
+function showUpdateCard(rel) {
+  if (document.getElementById('updCard')) return;
+  const label = (rel && (rel.name || rel.tag_name)) || 'new release';
+  const asset = ((rel && rel.assets) || []).find(a => /\.apk$/i.test(a.name || ''));
+  const el = document.createElement('div');
+  el.id = 'updCard';
+  el.innerHTML = '<div class="updrow"><div class="lmain"><div class="ltitle">Update available \u00b7 ' + esc(label) + '</div>' +
+    '<div class="lsub">a new Gitly release is on GitHub</div></div>' +
+    '<button class="btn sm primary" id="updGet">Update</button>' +
+    '<button class="iconbtn" id="updX" aria-label="dismiss">\u2715</button></div>';
+  document.body.appendChild(el);
+  const kill = () => { try { el.remove(); } catch (e) {} };
+  setTimeout(kill, 20000);
+  $('#updGet').addEventListener('click', () => {
+    if (asset && window.OneGit && window.OneGit.download) {
+      try { window.OneGit.download(asset.browser_download_url, asset.name); toast('Downloading ' + label); }
+      catch (e) { location.href = 'https://github.com/' + UPD_REPO + '/releases/latest'; }
+    } else location.href = 'https://github.com/' + UPD_REPO + '/releases/latest';
+    kill();
+  });
+  $('#updX').addEventListener('click', kill);
+}
+/* the newest published (non-draft) release on the OneGit repo -
+   independent of GitHub's "Latest" marker, so every release you post counts */
+async function latestPublishedRelease() {
+  const list = await api('/repos/' + UPD_REPO + '/releases?per_page=30', { accept: 'application/vnd.github.html+json' });
+  if (!Array.isArray(list)) return null;
+  const pub = list.filter(r => r && r.id && !r.draft && r.published_at);
+  pub.sort((a, b) => Date.parse(b.published_at) - Date.parse(a.published_at));
+  return pub.length ? pub[0] : null;
+}
+/* the release's "Describe this release" text, shown as a sheet */
+function showChangelogSheet(rel) {
+  const label = (rel && (rel.name || rel.tag_name)) || 'latest release';
+  const body = rel && rel.body_html ? fixMd(rel.body_html)
+    : (rel && rel.body ? esc(rel.body).replace(/\n/g, '<br>') : '<p class="dim">No description in this release.</p>');
+  openSheet('<div class="sheethead"><b>ChangeLog — ' + esc(label) + '</b><button class="iconbtn" data-act="closesheet">' + SVG.x + '</button></div>' +
+    '<div class="card md">' + body + '</div>');
+  try { const sc = document.querySelector('#sheet .sheetcard'); if (sc) inlineRepoImages(sc); } catch (e) {}
+}
+async function checkUpdate() {
+  if (UPD_CHECKED || !TOKEN) return;
+  UPD_CHECKED = true;
+  try {
+    const rel = await latestPublishedRelease();
+    if (!rel || !rel.id) return;
+    const published = Date.parse(rel.published_at || '') || 0;
+    const tagv = releaseVersion(rel);
+    // update when the release's tag version is newer than this app's version,
+    // or when the release was published after this install
+    const versionNewer = !!tagv && newerVersion(tagv, APPV);
+    const dateNewer = !!(published && INSTALLED_AT && published > INSTALLED_AT);
+    if (!versionNewer && !dateNewer) return;
+    const key = 'rel' + rel.id;
+    const asset = (rel.assets || []).find(a => /\.apk$/i.test(a.name || ''));
+    if (LS.get('autodl', false) && asset && LS.get('updDl', '') !== key) {
+      LS.set('updDl', key);
+      try { window.OneGit.download(asset.browser_download_url, asset.name); toast('Downloading update'); } catch (e) {}
+    }
+    if (LS.get('updShown', '') !== key) {
+      LS.set('updShown', key);
+      showUpdateCard(rel);
+    }
+  } catch (e) {}
+}
+
+/* ================= auth ================= */
+function doLogout(msg) {
+  let next = null;
+  if (USER && USER.login) {
+    const accs = getAccounts().filter(a => a.login !== USER.login);
+    saveAccounts(accs);
+    next = accs.length ? accs[0] : null;
+  }
+  if (next) { toast(msg || ('Signed out — switched to ' + next.login)); switchAccount(next.login); return; }
+  TOKEN = null; USER = null; LS.del('token');
+  try { if (window.OneGit && window.OneGit.saveToken) window.OneGit.saveToken(''); } catch (e) {}
+  try { if (window.OneGit && window.OneGit.setNotifications) window.OneGit.setNotifications(false); } catch (e) {}
+  if (msg) toast(msg); showLogin();
+}
+function saveTokenNative() { try { if (TOKEN && window.OneGit && window.OneGit.saveToken) window.OneGit.saveToken(TOKEN); } catch (e) {} }
+function showLogin() {
+  $('#app').hidden = true; $('#login').hidden = false;
+  const lv = $('#loginVer');
+  if (lv) lv.textContent = 'Gitly v' + APPV;
+  let cb = document.getElementById('loginCancel');
+  if (!cb) {
+    cb = document.createElement('button');
+    cb.id = 'loginCancel';
+    cb.className = 'btn ghost';
+    cb.style.cssText = 'display:block;margin:18px auto 0;width:180px';
+    cb.textContent = 'Cancel';
+    cb.addEventListener('click', () => { $('#login').hidden = true; $('#app').hidden = false; route(); });
+    const card = document.querySelector('#login .logincard');
+    if (card) card.appendChild(cb);
+  }
+  /* resume a pending GitHub device sign-in */
+  let fb = document.getElementById('oauthFinish');
+  const pend = oauthPending();
+  if (pend) {
+    if (!fb) {
+      fb = document.createElement('button');
+      fb.id = 'oauthFinish';
+      fb.className = 'btn ghost';
+      fb.style.cssText = 'display:block;margin:14px auto 0;width:260px';
+      fb.addEventListener('click', () => { showDeviceSheet(); oauthPollNow(); });
+      const lc = document.querySelector('#login .logincard');
+      if (lc && lc.parentNode) lc.parentNode.insertBefore(fb, lc.nextSibling);
+    }
+    fb.textContent = 'Continue — finish GitHub sign-in';
+    fb.hidden = false;
+    if (!oauthTimer) scheduleOauthPoll();
+  } else if (fb) fb.hidden = true;
+  cb.hidden = !TOKEN;
+}
+
+/* ================= accounts (multi-account) ================= */
+function getAccounts() { return LS.get('accounts', []); }
+function saveAccounts(a) { LS.set('accounts', a); }
+function addAccount(login, token, avatar) {
+  const accs = getAccounts();
+  const i = accs.findIndex(a => a.login === login);
+  const rec = { login, token, avatar: avatar || '', gistId: i >= 0 ? accs[i].gistId : null, pins: i >= 0 ? accs[i].pins : null };
+  if (i >= 0) accs[i] = rec; else accs.push(rec);
+  saveAccounts(accs);
+  return rec;
+}
+function saveGistToAccount() {
+  if (!USER) return;
+  const accs = getAccounts();
+  const i = accs.findIndex(a => a.login === USER.login);
+  if (i >= 0) { accs[i].gistId = gistId; accs[i].pins = pins; if (!accs[i].avatar && USER.avatar_url) accs[i].avatar = USER.avatar_url; saveAccounts(accs); }
+}
+function accountCachesClear() {
+  try { Object.keys(localStorage).filter(k => k.indexOf('onegit.c.') === 0).forEach(k => localStorage.removeItem(k)); } catch (e) {}
+}
+function switchAccount(login) {
+  const accs = getAccounts();
+  const acc = accs.find(a => a.login === login);
+  if (!acc || acc.token === TOKEN) return;
+  const out = accs.find(a => a.token === TOKEN);
+  if (out) out.pins = pins;
+  const keep = acc.pins || [];
+  saveAccounts(accs);
+  TOKEN = acc.token; USER = null;
+  LS.set('token', TOKEN);
+  gistId = acc.gistId || null; LS.set('gistId', gistId);
+  pins = keep; LS.set('pins', pins);
+  accountCachesClear();
+  saveTokenNative();
+  try { if (window.OneGit && window.OneGit.setNotifications) window.OneGit.setNotifications(LS.get('notify', true)); } catch (e) {}
+  toast('Switched to ' + login);
+  location.hash = '#/home';
+  route();
+}
+
+/* ================= router ================= */
+const view = () => $('#view');
+const ROUTES = [
+  { re: /^#\/home$/, tab: 0, detail: false, title: () => 'Hi, ' + (USER ? USER.login : 'there'), sub: () => '', render: renderHome },
+  { re: /^#\/productivity$/, tab: -1, detail: true, title: () => 'Productivity', sub: () => 'Your GitHub, by the numbers', render: renderProductivity },
+  { re: /^#\/activity$/, tab: -1, detail: true, title: () => 'Activity', sub: () => 'Everything from people you follow', render: renderActivity },
+  { re: /^#\/repos$/, tab: 1, detail: false, title: () => 'Repositories', sub: () => 'Your code, your stars, what is hot', render: renderRepos },
+  { re: /^#\/repo\/([^\/]+)\/([^\/]+)\/files(\/.*)?$/, tab: 1, detail: true, title: m => m[2], sub: m => m[1] + ' / ' + m[2] + ' — files', render: m => renderFiles(m[1], m[2], (m[3] || '').replace(/^\//, '')) },
+  { re: /^#\/repo\/([^\/]+)\/([^\/]+)\/commits$/, tab: 1, detail: true, title: () => 'Commits', sub: m => m[1] + ' / ' + m[2], render: m => renderCommits(m[1], m[2]) },
+  { re: /^#\/repo\/([^\/]+)\/([^\/]+)\/releases$/, tab: 1, detail: true, title: () => 'Releases', sub: m => m[1] + ' / ' + m[2], render: m => renderReleases(m[1], m[2]) },
+  { re: /^#\/repo\/([^\/]+)\/([^\/]+)\/issues$/, tab: 1, detail: true, title: () => 'Issues', sub: m => m[1] + ' / ' + m[2], render: m => renderRepoIssues(m[1], m[2]) },
+  { re: /^#\/repo\/([^\/]+)\/([^\/]+)\/pulls$/, tab: 1, detail: true, title: () => 'Pull requests', sub: m => m[1] + ' / ' + m[2], render: m => renderPulls(m[1], m[2]) },
+  { re: /^#\/repo\/([^\/]+)\/([^\/]+)\/actions$/, tab: 1, detail: true, title: () => 'Actions', sub: m => m[1] + ' / ' + m[2], render: m => renderActions(m[1], m[2]) },
+  { re: /^#\/repo\/([^\/]+)\/([^\/]+)\/security$/, tab: 1, detail: true, title: () => 'Security and quality', sub: m => m[1] + ' / ' + m[2], render: m => renderSecurity(m[1], m[2]) },
+  { re: /^#\/repo\/([^\/]+)\/([^\/]+)\/insights$/, tab: 1, detail: true, title: () => 'Insights', sub: m => m[1] + ' / ' + m[2], render: m => renderInsights(m[1], m[2]) },
+  { re: /^#\/actionrun\/([^\/]+)\/([^\/]+)\/(\d+)$/, tab: 1, detail: true, title: () => 'Workflow run', sub: m => m[1] + ' / ' + m[2], render: m => renderRun(m[1], m[2], +m[3]) },
+  { re: /^#\/repo\/([^\/]+)\/([^\/]+)\/settings$/, tab: 1, detail: true, title: () => 'Settings', sub: m => m[1] + ' / ' + m[2], render: m => renderRepoSettings(m[1], m[2]) },
+  { re: /^#\/repo\/([^\/]+)\/([^\/]+)$/, tab: 1, detail: true, title: m => m[2], sub: m => m[1] + ' / ' + m[2], render: m => renderRepo(m[1], m[2]) },
+  { re: /^#\/commit\/([^\/]+)\/([^\/]+)\/([0-9a-fA-F]{6,40})$/, tab: -1, detail: true, title: () => 'Commit', sub: m => m[1] + ' / ' + m[2], render: m => renderCommit(m[1], m[2], m[3]) },
+  { re: /^#\/commitfile\/([^\/]+)\/([^\/]+)\/([0-9a-fA-F]{6,40})\/(.+)$/, tab: -1, detail: true, title: m => decodeURIComponent(m[4]).split('/').pop(), sub: m => m[1] + ' / ' + m[2] + ' \u00b7 ' + m[3].slice(0, 7), render: m => renderCommitFile(m[1], m[2], m[3], decodeURIComponent(m[4])) },
+  { re: /^#\/issue\/([^\/]+)\/([^\/]+)\/(\d+)$/, tab: -1, detail: true, title: m => (m[4] === 'pr' ? 'PR #' : 'Issue #') + m[3], sub: m => m[1] + ' / ' + m[2], render: m => renderIssue(m[1], m[2], +m[3]) },
+  { re: /^#\/user\/([^\/]+)$/, tab: -1, detail: true, title: m => '@' + m[1], sub: () => 'GitHub profile', render: m => renderUser(m[1]) },
+  { re: /^#\/profile\/([^\/]+)$/, tab: -1, detail: true, title: () => 'Profile README', big: m => '@' + m[1], sub: () => '', render: m => renderProfileReadme(m[1]) },
+  { re: /^#\/commits$/, tab: 2, detail: false, title: () => 'Commits', sub: () => 'Your commits across every repository', render: renderCommitsHome },
+  { re: /^#\/issues$/, tab: -1, detail: false, title: () => 'Issues', sub: () => 'Issues and pull requests', render: renderIssues },
+  { re: /^#\/notifs$/, tab: -1, detail: false, title: () => 'Notifications', sub: () => 'Your unread threads', render: renderNotifs },
+  { re: /^#\/users\/([^\/]+)\/repos$/, tab: -1, detail: true, title: () => 'Repositories', sub: m => '@' + m[1], render: m => renderUserRepos(m[1]) },
+  { re: /^#\/users\/([^\/]+)\/(followers|following)$/, tab: -1, detail: true, title: m => m[2][0].toUpperCase() + m[2].slice(1), sub: m => '@' + m[1], render: m => renderUserList(m[1], m[2]) },
+  { re: /^#\/user\/([^\/]+)\/gists$/, tab: -1, detail: true, title: () => 'Gists', sub: m => '@' + m[1], render: m => renderGists(m[1]) },
+  { re: /^#\/gist\/([0-9a-f]+)$/, tab: -1, detail: true, title: () => 'Gist', sub: () => 'Snippet files', render: m => renderGist(m[1]) },
+  { re: /^#\/gists$/, tab: -1, detail: true, title: () => 'Your gists', sub: () => 'Snippets on your account', render: () => renderGists() },
+  { re: /^#\/settings$/, tab: -1, detail: false, title: () => 'Settings', sub: () => 'Make Gitly yours', render: renderSettings }
+];
+
+/* scales the big header title down so long names fit on one line
+   (34px down to a 22px floor); anything longer wraps at word
+   boundaries instead of breaking mid-word */
+function fitBigTitle() {
+  const el = $('#bigTitle');
+  if (!el) return;
+  el.style.fontSize = '';
+  const text = el.textContent || '';
+  if (!text) return;
+  const w = el.clientWidth;
+  if (!w) return;
+  try {
+    const c = fitBigTitle._m || (fitBigTitle._m = document.createElement('canvas').getContext('2d'));
+    c.font = '700 34px OneGitSans, system-ui, sans-serif';
+    const full = c.measureText(text).width;
+    if (full <= w) return;
+    el.style.fontSize = Math.max(22, Math.floor(34 * w / full)) + 'px';
+  } catch (e) { }
+}
+
+async function route() {
+  applyTheme();
+  applyA11y();
+  if (!TOKEN) { showLogin(); return; }
+  $('#login').hidden = true; $('#app').hidden = false;
+  if (!USER) {
+    const cu = LS.get('c.user', null);
+    if (cu) {
+      USER = cu;
+      api('/user').then(u => {
+        const changed = !cu || !u || cu.login !== u.login;
+        USER = u; LS.set('c.user', u);
+        if (changed || location.hash === '#/home' || location.hash === '') route();
+      }).catch(() => {});
+    } else {
+      try { USER = await api('/user'); LS.set('c.user', USER); } catch (e) { if (!TOKEN) return; }
+    }
+  }
+  const h = location.hash || '#/home';
+  let matched = null, m = null;
+  for (const r of ROUTES) { m = h.match(r.re); if (m) { matched = r; break; } }
+  if (!matched) { location.hash = '#/home'; return; }
+  $$('#navbar .navbtn').forEach(b => b.classList.toggle('active', b.dataset.tab == matched.tab));
+  const title = matched.title(m);
+  $('#bigTitle').textContent = matched.big ? matched.big(m) : title;
+  $('#appbarTitle').textContent = title;
+  fitBigTitle();
+  const sub = matched.sub ? matched.sub(m) : '';
+  $('#bigSub').textContent = sub; $('#bigSub').style.display = sub ? '' : 'none';
+  $('#backBig').hidden = !matched.detail;
+  $('#backApp').hidden = !matched.detail;
+  $('#refreshBig').hidden = matched.detail;
+  $('#refreshApp').hidden = matched.detail;
+  $('#settingsBig').hidden = false;
+  $('#settingsApp').hidden = false;
+  $('#appbar').classList.remove('on');
+  $('#scroller').scrollTop = 0;
+  closeSheet();
+  navShow();
+  view().innerHTML = spinner();
+  try { await matched.render(m); } catch (e) { view().innerHTML = errCard(e); }
+}
+
+/* ================= components ================= */
+function repoRow(r) {
+  const full = r.full_name || ((r.owner ? r.owner.login : '') + '/' + r.name);
+  return '<div class="card" data-go="#/repo/' + full + '">' +
+    '<div class="rcrow"><div class="rcname">' + esc(r.name) + '</div>' +
+    '<button class="pinbtn ' + (isPinned(full) ? 'pinned' : '') + '" data-pinbtn="' + esc(full) + '" aria-label="pin">' + SVG.star + '</button></div>' +
+    '<p class="rcdesc">' + esc(r.description || 'No description') + '</p>' +
+    '<div class="rcmeta">' + SVG.star + ' ' + nf(r.stargazers_count) + ' · ' + SVG.fork + ' ' + nf(r.forks_count) +
+    (r.language ? ' · <span class="dot" style="background:' + langColor(r.language) + '"></span>' + esc(r.language) : '') +
+    (r.private ? ' · <span class="chip">private</span>' : '') + '</div></div>';
+}
+function issueRow(i) {
+  const full = i.repository_url ? i.repository_url.replace('https://api.github.com/repos/', '') : '';
+  const closed = i.state !== 'open';
+  const isPR = !!i.pull_request;
+  return '<div class="lrow"' + (full ? ' data-go="#/issue/' + full + '/' + i.number + '"' : '') + '>' +
+    '<div class="istate' + (closed ? ' closed' : '') + '">' + (closed ? SVG.check : SVG.dot) + '</div>' +
+    '<div class="lmain"><div class="ltitle">' + esc(i.title) + '</div>' +
+    '<div class="lsub">' + (full ? esc(full) + ' · ' : '') + '#' + i.number + ' · ' + tAgo(i.updated_at) + ' · ' + (i.comments || 0) + ' comments' +
+    (isPR ? ' · <span class="chip pr">PR</span>' : '') + '</div></div></div>';
+}
+function commitRow(c, repoFull) {
+  const full = repoFull || (c.repository_url ? c.repository_url.replace('https://api.github.com/repos/', '') : '');
+  const msg = (c.commit && c.commit.message ? c.commit.message : '').split('\n')[0];
+  const who = c.author ? c.author.login : (c.commit && c.commit.author ? c.commit.author.name : 'unknown');
+  const av = c.author ? c.author.avatar_url : '';
+  const sha = c.sha ? c.sha.slice(0, 7) : '';
+  return '<div class="lrow" data-go="' + (full ? '#/commit/' + full + '/' + c.sha : '#/repos') + '"' + (full ? ' data-repo="' + esc(full) + '" data-sha="' + esc(c.sha) + '"' : '') + '>' +
+    (av ? '<img class="cav" src="' + esc(av) + '" alt="">' : SVG.commit) +
+    '<div class="lmain"><div class="ltitle">' + esc(msg) + '</div>' +
+    '<div class="lsub">' + esc(who) + ' · ' + tAgo(c.commit && c.commit.author ? c.commit.author.date : '') + ' · <span class="chip">' + sha + '</span></div></div></div>';
+}
+function eventRow(ev) {
+  const p = ev.payload || {};
+  const repo = ev.repo ? ev.repo.name : '';
+  let icon = SVG.user, cls = 'user', text = esc(ev.type || 'activity'), body = '';
+  switch (ev.type) {
+    case 'PushEvent':
+      icon = SVG.commit; cls = 'push';
+      text = '<b>' + esc(ev.actor.login) + '</b> pushed ' + (p.size || 1) + ' commit' + ((p.size || 1) > 1 ? 's' : '');
+      if (p.commits && p.commits.length) {
+        const msgs = p.commits.map(c => (c.message || '').split('\n')[0].trim()).filter(Boolean).slice(0, 4);
+        if (msgs.length) body = msgs.map(m => esc(m)).join('<br>');
+        if ((p.size || 0) > msgs.length) body += (body ? '<br>' : '') + '+' + ((p.size || 0) - msgs.length) + ' more commit' + ((p.size || 0) - msgs.length > 1 ? 's' : '');
+      }
+      break;
+    case 'WatchEvent': icon = SVG.star; cls = 'star'; text = '<b>' + esc(ev.actor.login) + '</b> starred this repo'; break;
+    case 'ForkEvent': icon = SVG.fork; cls = 'fork'; text = '<b>' + esc(ev.actor.login) + '</b> forked this repo' + (p.forkee ? ' → ' + esc(p.forkee.full_name) : ''); break;
+    case 'CreateEvent': icon = SVG.plus; cls = 'create'; text = '<b>' + esc(ev.actor.login) + '</b> created ' + (p.ref_type || 'repository') + (p.ref ? ' <b>' + esc(p.ref) + '</b>' : ''); break;
+    case 'IssuesEvent':
+      icon = SVG.dot; cls = 'issue';
+      text = '<b>' + esc(ev.actor.login) + '</b> ' + (p.action || 'updated') + ' an issue';
+      if (p.issue) body = esc(p.issue.title);
+      break;
+    case 'PullRequestEvent':
+      icon = SVG.pr; cls = 'pr';
+      text = '<b>' + esc(ev.actor.login) + '</b> ' + (p.action || 'updated') + ' a pull request';
+      if (p.pull_request) body = esc(p.pull_request.title);
+      break;
+    case 'IssueCommentEvent':
+      icon = SVG.comment; cls = 'comment';
+      text = '<b>' + esc(ev.actor.login) + '</b> commented';
+      if (p.issue) body = esc(p.issue.title);
+      break;
+    case 'ReleaseEvent': icon = SVG.tag; cls = 'tag'; text = '<b>' + esc(ev.actor.login) + '</b> released ' + (p.release ? '<b>' + esc(p.release.tag_name) + '</b>' : ''); break;
+    case 'DeleteEvent': icon = SVG.x; cls = 'comment'; text = '<b>' + esc(ev.actor.login) + '</b> deleted ' + (p.ref_type || '') + ' ' + esc(p.ref || ''); break;
+    case 'FollowEvent': icon = SVG.user; cls = 'user'; text = '<b>' + esc(ev.actor.login) + '</b> followed <b>@' + esc((p.target && p.target.login) || 'someone') + '</b>'; break;
+    case 'PublicEvent': icon = SVG.plus; cls = 'create'; text = '<b>' + esc(ev.actor.login) + '</b> open-sourced this repo'; break;
+    case 'GollumEvent': icon = SVG.file; cls = 'comment'; text = '<b>' + esc(ev.actor.login) + '</b> updated the wiki'; break;
+    case 'MemberEvent': icon = SVG.user; cls = 'user'; text = '<b>' + esc(ev.actor.login) + '</b> added ' + (p.member ? '<b>@' + esc(p.member.login) + '</b>' : 'a collaborator'); break;
+    case 'CommitCommentEvent': icon = SVG.comment; cls = 'comment'; text = '<b>' + esc(ev.actor.login) + '</b> commented on a commit'; if (p.comment) body = esc((p.comment.body || '').split('\n')[0]); break;
+    default: text = '<b>' + esc(ev.actor.login) + '</b> · ' + esc(ev.type || '');
+  }
+  return '<div class="lrow"' + (repo ? ' data-go="#/repo/' + repo + '"' : '') + '>' +
+    '<div class="eicon ' + cls + '">' + icon + '</div>' +
+    '<div class="lmain"><div class="ltitle" style="font-weight:500">' + text + '</div>' +
+    (body ? '<div class="lbody">' + body + '</div>' : '') +
+    '<div class="lsub">' + esc(repo) + ' · ' + tAgo(ev.created_at) + '</div></div></div>';
+}
+function fixMd(html, repo) {
+  try {
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    doc.querySelectorAll('script,style,iframe').forEach(x => x.remove());
+    /* GitHub's rendered HTML keeps repo-relative image paths (./assets/x.png),
+       which only resolve inside the repo - point them at the repo's raw files. */
+    const imgBase = repo ? 'https://raw.githubusercontent.com/' + repo + '/HEAD/'
+      : 'https://github.com/';
+    const aBase = repo ? 'https://github.com/' + repo + '/blob/HEAD/'
+      : 'https://github.com/';
+    doc.querySelectorAll('img').forEach(x => {
+      try { const s = x.getAttribute('src') || ''; if (s) x.src = new URL(s, imgBase).href; } catch (e) {}
+    });
+    doc.querySelectorAll('a').forEach(x => {
+      try {
+        const h = x.getAttribute('href') || '';
+        if (h && h.charAt(0) !== '#') x.href = new URL(h, aBase).href;
+        /* target="_blank" links are silently dropped by the WebView - remove
+           the target so taps actually go somewhere */
+        x.removeAttribute('target');
+        /* in-repo file links (pdf, zip, docx, code files…) become tap-to-download rows */
+        if (!repo) return;
+        const m = (x.getAttribute('href') || '').match(/^https:\/\/github\.com\/([^/]+)\/([^/]+)\/blob\/HEAD\/(.+)$/);
+        if (!m) return;
+        const p = m[3].replace(/^\.?\//, '');
+        const dot = p.lastIndexOf('.');
+        const ext = dot > -1 ? p.slice(dot + 1).toLowerCase() : '';
+        if (ext && MD_DL_EXTS.indexOf(' ' + ext + ' ') > -1) {
+          x.setAttribute('data-act', 'apidl');
+          x.setAttribute('data-owner', m[1]);
+          x.setAttribute('data-repo', m[2]);
+          x.setAttribute('data-path', p);
+          x.setAttribute('data-name', p.split('/').pop());
+        }
+      } catch (e) {}
+    });
+    return doc.body.innerHTML;
+  } catch (e) { return esc(html); }
+}
+/* attachments GitHub serves as downloadable links rather than rendered pages */
+const MD_DL_EXTS = ' pdf txt log csv tsv json yaml yml rtf doc docx xls xlsx ppt pptx zip gz tar 7z rar c h cpp cs java js ts py php sql xml ipynb sh bat ';
+/* raw.githubusercontent.com is unreachable on some networks (ISP blocks),
+   which left README images broken on those devices even though the app itself
+   works - so repo images are re-fetched through api.github.com, which every
+   Gitly feature already depends on, and swapped in as data: URIs.
+   Files over 1 MB are refused by the contents endpoint, so those go through
+   the git blobs API, which serves base64 up to GitHub's 100 MB limit. */
+const RAWIMG_CACHE = {};
+const MD_MIME = { png:'image/png', jpg:'image/jpeg', jpeg:'image/jpeg', gif:'image/gif', webp:'image/webp', svg:'image/svg+xml', bmp:'image/bmp', ico:'image/x-icon', mp4:'video/mp4', mov:'video/quicktime', webm:'video/webm' };
+const RAWIMG_PROM = {};
+/* label a data: URI correctly - trust the server unless it sends something generic */
+function imgMime(ct, path) {
+  const ext = ((path || '').split('?')[0].split('.').pop() || '').toLowerCase();
+  const byExt = MD_MIME[ext];
+  const c = (ct || '').split(';')[0].trim().toLowerCase();
+  if (!c || c === 'application/octet-stream' || c === 'text/plain' || c === 'binary/octet-stream') return byExt || 'application/octet-stream';
+  if (c === 'image/svg' || c === 'text/xml' || c === 'application/xml') return 'image/svg+xml';
+  return c;
+}
+/* small images are remembered in localStorage, so re-opening a README never
+   re-downloads them and animated art (the contribution snake, gifs) is not restarted */
+function lsImgGet(key) { try { return LS.get('img:' + key, null); } catch (e) { return null; } }
+function lsImgSet(key, data) {
+  try {
+    if (!data || data.length > 120000) return;
+    let idx = LS.get('imgIdx', []) || [];
+    if (idx.indexOf(key) === -1) idx.push(key);
+    while (idx.length > 25) { const old = idx.shift(); try { LS.del('img:' + old); } catch (e) {} }
+    LS.set('img:' + key, data); LS.set('imgIdx', idx);
+  } catch (e) {}
+}
+async function ghRawToData(o, n, path, ref) {
+  ref = ref || 'HEAD';
+  path = String(path).split('#')[0].split('?')[0];
+  const key = o + '/' + n + '/' + ref + '/' + path;
+  if (RAWIMG_CACHE[key]) return RAWIMG_CACHE[key];
+  if (RAWIMG_PROM[key]) return RAWIMG_PROM[key]; /* one fetch per image, ever */
+  const saved = lsImgGet(key);
+  if (saved) { RAWIMG_CACHE[key] = saved; return saved; }
+  const job = (async () => {
+    const headers = { 'Accept': 'application/vnd.github.raw', 'X-GitHub-Api-Version': '2022-11-28' };
+    if (TOKEN) headers.Authorization = 'Bearer ' + TOKEN;
+    const url = 'https://api.github.com/repos/' + o + '/' + n + '/contents/' + path + '?ref=' + encodeURIComponent(ref);
+    try {
+      const res = await fetch(url, { headers, cache: 'no-store' });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const ct = res.headers.get('content-type') || '';
+      const buf = new Uint8Array(await res.arrayBuffer());
+      let bin = '';
+      for (let i = 0; i < buf.length; i += 0x8000) bin += String.fromCharCode.apply(null, buf.subarray(i, i + 0x8000));
+      const data = 'data:' + imgMime(ct, path) + ';base64,' + btoa(bin);
+      if (buf.length < 8 * 1024 * 1024) { RAWIMG_CACHE[key] = data; lsImgSet(key, data); }
+      return data;
+    } catch (e) {
+      /* too big for the contents endpoint - fetch the blob's base64 instead */
+      const h2 = { 'X-GitHub-Api-Version': '2022-11-28' };
+      if (TOKEN) h2.Authorization = 'Bearer ' + TOKEN;
+      const meta = await fetch(url, { headers: h2, cache: 'no-store' });
+      if (!meta.ok) throw new Error('HTTP ' + meta.status);
+      const j = await meta.json();
+      if (!j || !j.sha) throw new Error('no sha');
+      const bl = await fetch('https://api.github.com/repos/' + o + '/' + n + '/git/blobs/' + j.sha, { headers: h2, cache: 'no-store' });
+      if (!bl.ok) throw new Error('HTTP ' + bl.status);
+      const b = await bl.json();
+      if (!b || b.encoding !== 'base64' || !b.content) throw new Error('no blob content');
+      const data2 = 'data:' + imgMime('', path) + ';base64,' + b.content.replace(/\s/g, '');
+      if ((b.size || 0) < 8 * 1024 * 1024) { RAWIMG_CACHE[key] = data2; lsImgSet(key, data2); }
+      return data2;
+    }
+  })();
+  RAWIMG_PROM[key] = job;
+  job.then(() => { delete RAWIMG_PROM[key]; }, () => { delete RAWIMG_PROM[key]; });
+  return job;
+}
+/* turn any GitHub file URL - raw.githubusercontent.com, github.com/.../blob/...,
+   github.com/.../raw/... - into owner/repo/ref/path for the contents API.
+   Query strings such as ?raw=true are dropped: the API rejects them, which is
+   what left the contribution snake and other README art broken before. */
+function ghFileFromUrl(u) {
+  try {
+    const url = new URL(String(u));
+    let m;
+    if (url.hostname === 'raw.githubusercontent.com') {
+      m = url.pathname.match(/^\/([^\/]+)\/([^\/]+)\/([^\/]+)\/(.+)$/);
+      if (m) return { owner: m[1], repo: m[2], ref: m[3], path: decodeURIComponent(m[4]) };
+    } else if (url.hostname === 'github.com' || url.hostname === 'www.github.com') {
+      m = url.pathname.match(/^\/([^\/]+)\/([^\/]+)\/(?:blob|raw)\/([^\/]+)\/(.+)$/);
+      if (m) return { owner: m[1], repo: m[2], ref: m[3], path: decodeURIComponent(m[4]) };
+    }
+  } catch (e) {}
+  return null;
+}
+/* GitHub rewrites every external README image to a camo.githubusercontent.com
+   proxy URL, and that host is unreachable on some networks. The hex segment of
+   a camo URL is the real image URL, so unmask it and load that directly.
+   Non-ASCII bytes (emoji in badge URLs!) must stay percent-encoded. */
+function camoDecode(u) {
+  const m = String(u).match(/^https:\/\/camo\.githubusercontent\.com\/[0-9a-f]+\/([0-9a-f]{16,})/i);
+  if (!m) return '';
+  const hex = m[1];
+  let s = '';
+  for (let i = 0; i + 1 < hex.length; i += 2) {
+    const b = parseInt(hex.substr(i, 2), 16);
+    if (b >= 0x20 && b < 0x7f) s += String.fromCharCode(b);
+    else s += '%' + hex.substr(i, 2).toUpperCase();
+  }
+  return s;
+}
+/* native media fallback: when the WebView cannot load an image, the app
+   fetches it natively and hands back a data: URI */
+const MEDIA_WAITERS = {};
+window.__mediaFetched = (url, ok, dataUri) => {
+  const w = MEDIA_WAITERS[url];
+  if (!w) return;
+  delete MEDIA_WAITERS[url];
+  w.forEach(fn => fn(ok && dataUri ? dataUri : null));
+};
+function nativeMedia(url) {
+  return new Promise((res, rej) => {
+    if (!window.OneGit || !OneGit.fetchMedia) return rej(new Error('no bridge'));
+    (MEDIA_WAITERS[url] = MEDIA_WAITERS[url] || []).push(d => d ? res(d) : rej(new Error('fetch failed')));
+    try { OneGit.fetchMedia(url); } catch (e) { rej(e); }
+  });
+}
+function setImgData(img, p) { p.then(data => { img.src = data; }).catch(() => {}); }
+function mdImgFallback(img) {
+  img.onerror = () => {
+    img.onerror = null;
+    const s = img.getAttribute('src') || '';
+    if (!s || s.indexOf('data:') === 0) return;
+    nativeMedia(s).then(d => { img.src = d; }).catch(() => {});
+  };
+}
+/* after README/issue HTML lands in the DOM, inline every raw.githubusercontent
+   image and unmask every camo one; if the fetch fails the original URL stays */
+/* load an <img> from the first source that works; if they all fail the broken
+   icon is replaced by a tappable link, so nothing is ever left unreadable */
+function imgFallbackChain(img, sources) {
+  const list = sources.filter(Boolean);
+  let i = 0;
+  const step = () => {
+    if (i >= list.length) { markImgBroken(img, list[0]); return; }
+    let s = list[i++];
+    if (typeof s === 'function') { try { s = s(); } catch (e) { return step(); } }
+    const use = d => { img.onerror = () => { img.onerror = null; step(); }; img.src = d; };
+    if (s && typeof s.then === 'function') s.then(use).catch(step);
+    else use(s);
+  };
+  step();
+}
+function markImgBroken(img, url) {
+  try {
+    img.onerror = null;
+    const alt = img.getAttribute('alt') || 'image';
+    const a = document.createElement('a');
+    a.className = 'imgfallback';
+    a.setAttribute('data-act', 'ext');
+    a.setAttribute('data-url', url || '');
+    a.textContent = alt + ' — tap to open';
+    if (img.parentNode) img.parentNode.replaceChild(a, img);
+  } catch (e) {}
+}
+/* after README/issue HTML lands in the DOM, inline every repository image and
+   unmask every camo one; each image is fetched once, and any that cannot be
+   loaded at all becomes a link instead of a broken icon */
+/* GitHub serves modern README art - the contribution snake above all - inside
+   a <picture> with <source srcset> dark/light variants, and the browser picks
+   the image from the SOURCE, not from <img src>. Inlining only the img left the
+   browser fetching the blocked raw URL, so the snake never appeared. Every
+   source is resolved too, and any that cannot be fetched is dropped so the
+   <img> fallback takes over. */
+function inlinePictureSources(el) {
+  el.querySelectorAll('picture').forEach(pic => {
+    pic.querySelectorAll('source').forEach(s => {
+      if (s.dataset.gi) return;
+      s.dataset.gi = '1';
+      const first = (s.getAttribute('srcset') || '').split(',')[0].trim().split(/\s+/)[0];
+      if (!first || first.indexOf('data:') === 0) return;
+      const f = ghFileFromUrl(first);
+      if (!f) return;
+      ghRawToData(f.owner, f.repo, f.path, f.ref)
+        .then(d => { try { s.setAttribute('srcset', d); } catch (e) {} })
+        .catch(() => { try { s.remove(); } catch (e) {} });
+    });
+  });
+}
+/* after README/issue HTML lands in the DOM, inline every repository image and
+   unmask every camo one; each image is fetched once, and any that cannot be
+   loaded at all becomes a link instead of a broken icon */
+function inlineRepoImages(el) {
+  if (!el || !el.querySelectorAll) return;
+  inlinePictureSources(el);
+  el.querySelectorAll('img').forEach(img => {
+    if (img.dataset.gi) return; /* already handled - never fetch the same image twice */
+    const src = img.getAttribute('src') || '';
+    if (!src || src.indexOf('data:') === 0) { img.dataset.gi = '1'; return; }
+    img.dataset.gi = '1';
+    /* an img srcset wins over src in the browser - inline it too, or drop it
+       so the src we control is what actually gets loaded */
+    if (img.hasAttribute('srcset')) {
+      const first = (img.getAttribute('srcset') || '').split(',')[0].trim().split(/\s+/)[0];
+      const fs = first ? ghFileFromUrl(first) : null;
+      if (fs) ghRawToData(fs.owner, fs.repo, fs.path, fs.ref).then(d => { try { img.setAttribute('srcset', d); } catch (e) {} }).catch(() => { try { img.removeAttribute('srcset'); } catch (e) {} });
+      else { try { img.removeAttribute('srcset'); } catch (e) {} }
+    }
+    let real = src;
+    if (/^https:\/\/camo\.githubusercontent\.com\//.test(src)) {
+      const dec = camoDecode(src);
+      if (dec) real = dec;
+    }
+    const f = ghFileFromUrl(real);
+    if (f) {
+      /* repository file: the API route first (raw.githubusercontent is blocked
+         on many networks), then the direct URL, then the native bridge */
+      imgFallbackChain(img, [
+        ghRawToData(f.owner, f.repo, f.path, f.ref),
+        real,
+        () => nativeMedia(real)
+      ]);
+      return;
+    }
+    if (/^https:/.test(real)) {
+      imgFallbackChain(img, [real, src, () => nativeMedia(real)]);
+      return;
+    }
+    /* repo-relative or unknown scheme: try to resolve it against the repo */
+    const rel = real.replace(/^\.\//, '');
+    if (el.dataset && el.dataset.repo) {
+      const parts = el.dataset.repo.split('/');
+      imgFallbackChain(img, [ghRawToData(parts[0], parts[1], rel, 'HEAD'), () => nativeMedia(src)]);
+    }
+  });
+  /* embedded videos: if the WebView cannot stream one, fetch it natively */
+  el.querySelectorAll('video, video source').forEach(v => {
+    const s = v.getAttribute('src') || '';
+    if (!s || s.indexOf('data:') === 0) return;
+    v.addEventListener('error', () => {
+      nativeMedia(s).then(d => { v.src = d; v.load && v.load(); }).catch(() => {});
+    }, true);
+  });
+}
+function openSheet(inner) { const s = $('#sheet'); s.innerHTML = '<div class="sheetcard">' + inner + '</div>'; s.hidden = false; document.body.classList.add('sheetopen'); }
+function closeSheet() { const s = $('#sheet'); if (s) { s.hidden = true; s.innerHTML = ''; } document.body.classList.remove('sheetopen'); }
+
+/* ================= views: home ================= */
+/* ================= views: productivity ================= */
+function heatLevel(c) { return c === 0 ? 0 : c < 3 ? 1 : c < 7 ? 2 : c < 12 ? 3 : 4; }
+function prodHtml(cc) {
+  const cal = cc.contributionCalendar;
+  const days = [];
+  cal.weeks.forEach(w => w.contributionDays.forEach(d => days.push(d)));
+  const byDate = {};
+  days.forEach(d => byDate[d.date] = d.contributionCount);
+  const dStr = off => { const t = new Date(); t.setDate(t.getDate() - off); return t.toISOString().slice(0, 10); };
+  const sumLast = n => { let s = 0; for (let i = 0; i < n; i++) s += (byDate[dStr(i)] || 0); return s; };
+  const week = sumLast(7), month = sumLast(30);
+  let i = days.length - 1;
+  while (i >= 0 && days[i].contributionCount === 0) i--;
+  let cur = 0;
+  while (i >= 0 && days[i].contributionCount > 0) { cur++; i--; }
+  let best = 0, run = 0, bd = null;
+  days.forEach(d => {
+    if (d.contributionCount > 0) { run++; if (run > best) best = run; } else run = 0;
+    if (!bd || d.contributionCount > bd.contributionCount) bd = d;
+  });
+  const avg = days.length ? cal.totalContributions / days.length : 0;
+  let graph = '<div class="heatwrap">';
+  cal.weeks.forEach(w => {
+    graph += '<div class="heatcol">' + w.contributionDays.map(d =>
+      '<span class="heatcell l' + heatLevel(d.contributionCount) + '" title="' + d.date + ' · ' + d.contributionCount + ' contributions"></span>').join('') + '</div>';
+  });
+  graph += '</div>';
+  const legend = '<div class="lgdrow" style="margin-top:12px;align-items:center">Less ' +
+    [0, 1, 2, 3, 4].map(l => '<span class="heatcell l' + l + '" style="display:inline-block"></span>').join('') + ' More</div>';
+  const repos = (cc.commitContributionsByRepository || []).slice()
+    .sort((a, b) => b.contributions.totalCount - a.contributions.totalCount).slice(0, 5);
+  let html = '<div class="card"><div class="ltitle" style="margin-bottom:10px">Contribution graph · last 12 months</div>' + graph + legend + '</div>';
+  html += activityRadar(cc);
+  html += '<h2 class="sect">Right now</h2><div class="card"><div class="bigstats">' +
+    '<div class="bstat"><b>' + nf(week) + '</b><span>this week</span></div>' +
+    '<div class="bstat"><b>' + nf(month) + '</b><span>this month</span></div>' +
+    '<div class="bstat"><b>' + cur + 'd</b><span>current streak</span></div>' +
+    '<div class="bstat"><b>' + best + 'd</b><span>longest streak</span></div>' +
+    '<div class="bstat"><b>' + avg.toFixed(1) + '</b><span>daily average</span></div>' +
+    '<div class="bstat"><b>' + nf(bd ? bd.contributionCount : 0) + '</b><span>busiest day</span></div></div></div>';
+  html += '<h2 class="sect">This year on GitHub</h2><div class="card"><div class="bigstats">' +
+    '<div class="bstat"><b>' + nf(cc.totalCommitContributions) + '</b><span>commits made</span></div>' +
+    '<div class="bstat"><b>' + nf(cc.totalPullRequestContributions) + '</b><span>pull requests</span></div>' +
+    '<div class="bstat"><b>' + nf(cc.totalIssueContributions) + '</b><span>issues</span></div>' +
+    '<div class="bstat"><b>' + nf(cc.totalPullRequestReviewContributions) + '</b><span>reviews</span></div>' +
+    '<div class="bstat"><b>' + nf(cc.totalRepositoryContributions) + '</b><span>new repos</span></div>' +
+    '<div class="bstat"><b>' + nf(cal.totalContributions) + '</b><span>contributions</span></div></div></div>';
+  html += '<h2 class="sect">Most active repositories</h2>';
+  html += repos.length ? '<div class="card list">' + repos.map(r =>
+    '<div class="lrow" data-go="#/repo/' + esc(r.repository.nameWithOwner) + '">' + SVG.code +
+    '<div class="lmain"><div class="ltitle">' + esc(r.repository.nameWithOwner) + '</div>' +
+    '<div class="lsub">' + nf(r.contributions.totalCount) + ' commits this year</div></div></div>').join('') + '</div>' :
+    '<div class="card empty">No repository activity yet.</div>';
+  return html;
+}
+/* GitHub's "Activity overview" - a four-axis chart of what your contributions
+   were actually made of: commits, pull requests, code review and issues, each
+   plotted as its share of the total. Same numbers as the "This year on GitHub"
+   card below it, drawn the way github.com draws them. */
+function activityRadar(cc) {
+  const cats = [
+    { v: cc.totalCommitContributions, label: 'Commits', color: '#12B76A' },
+    { v: cc.totalPullRequestContributions, label: 'Pull requests', color: '#8B5CF6' },
+    { v: cc.totalPullRequestReviewContributions, label: 'Code review', color: '#F59E0B' },
+    { v: cc.totalIssueContributions, label: 'Issues', color: '#1B6EF3' }
+  ];
+  const vals = cats.map(c => Math.max(0, Number(c.v) || 0));
+  const total = vals.reduce((a, b) => a + b, 0);
+  const pct = vals.map(v => total ? Math.round(100 * v / total) : 0);
+  const W = 320, H = 232, cx = W / 2, cy = H / 2 + 4, R = 72;
+  /* commits to the left, issues right, code review up, pull requests down */
+  const px = [
+    [cx - R * pct[0] / 100, cy],
+    [cx + R * pct[3] / 100, cy],
+    [cx, cy - R * pct[2] / 100],
+    [cx, cy + R * pct[1] / 100]
+  ];
+  let svg = '<svg viewBox="0 0 ' + W + ' ' + H + '" class="radar" role="img" aria-label="Activity overview">';
+  svg += '<line x1="' + cx + '" y1="' + (cy - R) + '" x2="' + cx + '" y2="' + (cy + R) + '" class="radaraxis"/>';
+  svg += '<line x1="' + (cx - R) + '" y1="' + cy + '" x2="' + (cx + R) + '" y2="' + cy + '" class="radaraxis"/>';
+  svg += '<polygon points="' + px.map(p => p[0].toFixed(1) + ',' + p[1].toFixed(1)).join(' ') + '" class="radararea"/>';
+  px.forEach((p, i) => {
+    svg += '<circle cx="' + p[0].toFixed(1) + '" cy="' + p[1].toFixed(1) + '" r="3.4" fill="' + cats[i].color + '"/>';
+  });
+  svg += '<text x="' + (cx - R - 10) + '" y="' + (cy + 4) + '" class="radarlabel end">Commits ' + pct[0] + '%</text>';
+  svg += '<text x="' + (cx + R + 10) + '" y="' + (cy + 4) + '" class="radarlabel">Issues ' + pct[3] + '%</text>';
+  svg += '<text x="' + cx + '" y="' + (cy - R - 10) + '" class="radarlabel mid">Code review ' + pct[2] + '%</text>';
+  svg += '<text x="' + cx + '" y="' + (cy + R + 20) + '" class="radarlabel mid">Pull requests ' + pct[1] + '%</text>';
+  svg += '</svg>';
+  const legend = cats.map((c, i) =>
+    '<div class="lgdrow" style="align-items:center;justify-content:space-between;padding:7px 0">' +
+    '<div class="lgdrow" style="align-items:center"><span class="dot" style="background:' + c.color + '"></span>' +
+    '<span style="margin-left:8px;font-size:13px">' + c.label + '</span></div>' +
+    '<div class="lsub">' + pct[i] + '% · ' + nf(vals[i]) + '</div></div>').join('');
+  return '<h2 class="sect">Activity overview</h2><div class="card">' +
+    (total ? svg + '<div style="margin-top:4px">' + legend + '</div>'
+           : '<div class="empty" style="padding:10px 0">No contributions in the last year yet.</div>') + '</div>';
+}
+async function renderProductivity() {
+  const seq = ++RSEQ;
+  if (!PDATE) PDATE = todayStr();
+  const cached = LS.get('c.prod', null);
+  const paint = cc => {
+    let html = '<div class="seg" style="margin-bottom:16px"><button class="segb' + (PTAB === 'overview' ? ' on' : '') + '" data-pt="overview">Overview</button><button class="segb' + (PTAB === 'today' ? ' on' : '') + '" data-pt="today">Today</button></div>';
+    html += PTAB === 'today' ? todayHtml(cc) : (cc ? prodHtml(cc) : spinner());
+    if (seq !== RSEQ) return;
+    view().innerHTML = html;
+    $$('[data-pt]').forEach(b => b.addEventListener('click', () => { PTAB = b.dataset.pt; renderProductivity(); }));
+    wireDayPicker();
+  };
+  paint(cached);
+  const query = 'query{viewer{login contributionsCollection{totalCommitContributions totalPullRequestContributions totalIssueContributions totalPullRequestReviewContributions totalRepositoryContributions commitContributionsByRepository(maxRepositories:10){contributions{totalCount} repository{nameWithOwner stargazerCount}} contributionCalendar{totalContributions weeks{contributionDays{date contributionCount}}}}}}';
+  try {
+    const r = await api('/graphql', { method: 'POST', body: JSON.stringify({ query }) });
+    const cc = r && r.data && r.data.viewer && r.data.viewer.contributionsCollection;
+    if (!cc) throw new Error('No stats returned');
+    LS.set('c.prod', cc);
+    paint(cc);
+    widgetPush();
+  } catch (e) { if (seq !== RSEQ) return; if (!cached) view().innerHTML = errCard(e); }
+  if (PTAB === 'today') loadDay();
+}
+
+/* ---- Today tab: stats for a particular day ---- */
+let PTAB = 'overview', PDATE = '';
+function todayStr() { return new Date().toISOString().slice(0, 10); }
+function todayHtml(cc) {
+  const isToday = PDATE === todayStr();
+  let cnt = 0, last7 = [];
+  if (cc && cc.contributionCalendar) {
+    const byDate = {};
+    cc.contributionCalendar.weeks.forEach(w => w.contributionDays.forEach(x => byDate[x.date] = x.contributionCount));
+    cnt = byDate[PDATE] || 0;
+    for (let i = 6; i >= 0; i--) {
+      const t = new Date(); t.setDate(t.getDate() - i);
+      const ds = t.toISOString().slice(0, 10);
+      last7.push({ ds, c: byDate[ds] || 0, wd: 'SMTWTFS'.charAt(t.getDay()) });
+    }
+  }
+  const max = Math.max.apply(null, last7.map(x => x.c).concat([1]));
+  const d = new Date(PDATE + 'T00:00:00');
+  return '<div class="card" style="text-align:center;padding:24px 20px">' +
+    '<div class="lsub">' + (isToday ? 'Today · ' : '') + d.toLocaleDateString(undefined, { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' }) + '</div>' +
+    '<div style="font-size:52px;font-weight:800;letter-spacing:-1px;margin:6px 0 2px">' + nf(cnt) + '</div>' +
+    '<div class="lsub">contributions</div></div>' +
+    '<div class="card"><div class="ltitle" style="margin-bottom:6px">Last 7 days — tap a bar</div>' +
+    '<div class="daybars">' + last7.map(x =>
+      '<div class="daybar' + (x.ds === PDATE ? ' cur' : '') + '" data-day="' + x.ds + '"><span style="height:' + Math.max(6, Math.round(x.c / max * 76)) + 'px"></span><i>' + x.wd + '</i></div>').join('') + '</div></div>' +
+    '<div class="card"><div class="ltitle" style="margin-bottom:8px">Pick a day</div>' +
+    '<div style="display:flex;gap:8px"><input type="date" class="fld" id="dayPick" value="' + PDATE + '" style="flex:1">' +
+    '<button class="btn ghost" id="todayBtn">Today</button></div></div>' +
+    '<h2 class="sect">That day</h2><div class="card" id="dayDetail">' + spinner(true) + '</div>';
+}
+function wireDayPicker() {
+  const dp = $('#dayPick');
+  if (dp) dp.addEventListener('change', () => { PDATE = dp.value || todayStr(); renderProductivity(); });
+  const tb = $('#todayBtn');
+  if (tb) tb.addEventListener('click', () => { PDATE = todayStr(); renderProductivity(); });
+  $$('[data-day]').forEach(b => b.addEventListener('click', () => { PDATE = b.dataset.day; renderProductivity(); }));
+}
+async function loadDay() {
+  const seq = ++RSEQ;
+  const el = $('#dayDetail'); if (!el) return;
+  const q = 'query($from:DateTime!,$to:DateTime!){viewer{contributionsCollection(from:$from,to:$to){totalCommitContributions totalPullRequestContributions totalIssueContributions totalPullRequestReviewContributions commitContributionsByRepository(maxRepositories:10){contributions{totalCount} repository{nameWithOwner}}}}}';
+  try {
+    const r = await api('/graphql', { method: 'POST', body: JSON.stringify({ query: q, variables: { from: PDATE + 'T00:00:00Z', to: PDATE + 'T23:59:59Z' } }) });
+    const cc = r && r.data && r.data.viewer && r.data.viewer.contributionsCollection;
+    if (!cc) throw new Error('No data');
+    const repos = (cc.commitContributionsByRepository || []).filter(x => x.contributions.totalCount > 0);
+    if (seq !== RSEQ) return;
+    el.innerHTML = '<div class="bigstats">' +
+      '<div class="bstat"><b>' + nf(cc.totalCommitContributions) + '</b><span>commits</span></div>' +
+      '<div class="bstat"><b>' + nf(cc.totalPullRequestContributions) + '</b><span>pull requests</span></div>' +
+      '<div class="bstat"><b>' + nf(cc.totalIssueContributions) + '</b><span>issues</span></div>' +
+      '<div class="bstat"><b>' + nf(cc.totalPullRequestReviewContributions) + '</b><span>reviews</span></div></div>' +
+      (repos.length ? '<div class="ltitle" style="margin:16px 0 4px">Worked on</div><div class="list">' + repos.map(x =>
+        '<div class="lrow" data-go="#/repo/' + esc(x.repository.nameWithOwner) + '">' + SVG.code +
+        '<div class="lmain"><div class="ltitle">' + esc(x.repository.nameWithOwner) + '</div>' +
+        '<div class="lsub">' + x.contributions.totalCount + ' commit' + (x.contributions.totalCount > 1 ? 's' : '') + '</div></div></div>').join('') + '</div>' :
+        '<div class="lsub dim" style="margin-top:10px">No repository commits that day.</div>');
+  } catch (e) { if (seq !== RSEQ) return; el.innerHTML = '<div class="lsub dim">Could not load the details for this day.</div>'; }
+}
+
+/* ================= activity history (persistent, never cleared) ================= */
+function mergeHist(evs) {
+  const old = LS.get('c.hist', null) || LS.get('c.feed', null) || [];
+  const map = new Map();
+  old.forEach(e => { if (e && e.id) map.set(e.id, e); });
+  (evs || []).forEach(e => { if (e && e.id) map.set(e.id, e); });
+  const merged = Array.from(map.values()).sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0));
+  LS.set('c.hist', merged.slice(0, 300));
+  return merged.slice(0, 300);
+}
+async function refreshActivity(login) {
+  const own = await api('/users/' + login + '/events?per_page=100').catch(() => []);
+  const rec = await api('/users/' + login + '/received_events?per_page=50').catch(() => []);
+  return mergeHist((Array.isArray(own) ? own : []).concat(Array.isArray(rec) ? rec : []));
+}
+
+async function renderHome() {
+  const seq = ++RSEQ;
+  checkUpdate();
+  const u = USER || await api('/user');
+  let html = '<div class="card profile" data-go="' + specialRepoGo(u.login) + '"><button class="pavalert" data-go="#/notifs" aria-label="Alerts">' + SVG.bell + '</button><button class="pavalert iss" data-go="#/issues" aria-label="Issues"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg></button><img class="pav" src="' + esc(u.avatar_url) + '" alt="">' +
+    '<div class="pname">' + esc(u.name || u.login) + '</div>' +
+    '<div class="plogin" data-go="#/user/' + esc(u.login) + '">@' + esc(u.login) + '</div>' +
+    (u.bio ? '<p class="pbio">' + esc(u.bio) + '</p>' : '') +
+    '<div class="pstats">' +
+    '<div class="pstat" data-go="#/users/' + esc(u.login) + '/repos"><b>' + nf(u.public_repos) + '</b><span>repos</span></div>' +
+    '<div class="pstat" data-go="#/users/' + esc(u.login) + '/followers"><b>' + nf(u.followers) + '</b><span>followers</span></div>' +
+    '<div class="pstat" data-go="#/users/' + esc(u.login) + '/following"><b>' + nf(u.following) + '</b><span>following</span></div></div></div>';
+  html += '<div class="card quicklinks"><button class="btn ghost" data-go="#/productivity">Productivity</button><button class="btn ghost" data-act="discover">Discover</button><button class="btn ghost" data-go="#/user/' + esc(u.login) + '">My profile</button></div>';
+  html += '<h2 class="sect">Pinned repositories</h2>';
+  html += pins.length ? pins.map(repoRow).join('') : '<div class="card empty">Star any repository in the Repositories tab to pin it here.<br><span class="dim">Pins sync to all your devices via your GitHub account.</span></div>';
+  const feedHtml = evs => (evs.length ? '<div class="card list">' + evs.slice(0, 3).map(eventRow).join('') + '</div>' : '<div class="card empty">Nothing here yet — your GitHub activity will show up as you go.</div>') +
+    '<button class="btn ghost btnblock" style="margin-top:12px" id="allActBtn">View all activity</button>';
+  const cHist = LS.get('c.hist', null) || LS.get('c.feed', null) || [];
+  html += '<h2 class="sect">Recent activity</h2><div id="feedWrap">' + (cHist.length ? feedHtml(cHist) : spinner()) + '</div>';
+  if (seq !== RSEQ) return;
+  view().innerHTML = html;
+  checkSpecialRepo(u.login);
+  const wireAct = () => { const nb = $('#allActBtn'); if (nb) nb.addEventListener('click', () => location.hash = '#/activity'); };
+  wireAct();
+  try {
+    const merged = await refreshActivity(u.login);
+    const fw = $('#feedWrap');
+    if (fw && seq === RSEQ) fw.innerHTML = feedHtml(merged);
+    wireAct();
+  } catch (e) { if (seq !== RSEQ) return; if (!cHist.length) { const fw = $('#feedWrap'); if (fw) fw.innerHTML = errCard(e); } }
+}
+
+async function renderActivity() {
+  const seq = ++RSEQ;
+  const u = USER || await api('/user');
+  const cHist = LS.get('c.hist', null) || LS.get('c.feed', null) || [];
+  if (seq !== RSEQ) return;
+  view().innerHTML = cHist.length ? '<div class="card list">' + cHist.map(eventRow).join('') + '</div>' : spinner();
+  try {
+    const merged = await refreshActivity(u.login);
+    if (seq !== RSEQ) return;
+    view().innerHTML = merged.length ? '<div class="card list">' + merged.map(eventRow).join('') + '</div>' : '<div class="card empty">No activity yet.</div>';
+  } catch (e) { if (seq !== RSEQ) return; if (!cHist.length) view().innerHTML = errCard(e); }
+}
+
+/* ================= views: repos (mine / starred / discover + search) ================= */
+let RS = { mode: 'mine', q: '', page: 1, items: [] };
+async function renderRepos() {
+  const seq = ++RSEQ;
+  RS = { mode: RS.mode || 'mine', q: '', page: 1, items: [] };
+  if (seq !== RSEQ) return;
+  view().innerHTML = '<button class="btn ghost btnblock" id="newRepoBtn" style="margin-bottom:12px">New repository</button>' +
+    '<div class="searchbar" id="searchWrap">' + SVG.search + '<input id="repoSearch" placeholder="' + (RS.mode === 'discover' ? 'Search all of GitHub…' : 'Search repos and people…') + '" autocomplete="off"></div>' +
+    '<div class="seg" id="repoSeg">' +
+    '<button class="segb' + (RS.mode === 'mine' ? ' on' : '') + '" data-mode="mine">Mine</button>' +
+    '<button class="segb' + (RS.mode === 'starred' ? ' on' : '') + '" data-mode="starred">Starred</button>' +
+    '<button class="segb' + (RS.mode === 'discover' ? ' on' : '') + '" data-mode="discover">Discover</button></div>' +
+    sortRowHTML('repos') +
+    '<div id="repoList">' + spinner() + '</div>' +
+    '<button id="repoMore" class="morebtn" hidden>Load more</button>';
+  $('#newRepoBtn').addEventListener('click', newRepoSheet);
+  let t;
+  $('#repoSearch').addEventListener('input', e => { clearTimeout(t); t = setTimeout(() => { RS.q = e.target.value.trim(); loadRepos(true); }, 450); });
+  $('#repoSearch').addEventListener('keydown', e => { if (e.key === 'Enter') { clearTimeout(t); RS.q = e.target.value.trim(); loadRepos(true); } });
+  $$('#repoSeg .segb').forEach(b => b.addEventListener('click', () => { RS.mode = b.dataset.mode; renderRepos(); }));
+  $('#repoMore').addEventListener('click', () => { RS.page++; loadRepos(false); });
+  wireSortRow('repos', () => paintRepoList(RS.people));
+  loadRepos(true);
+}
+function paintRepoList(people) {
+  const list = $('#repoList'); if (!list) return;
+  let html = '';
+  if (people && people.total_count > 0) {
+    html += '<div class="card" style="padding:0 0 4px"><div class="lsub" style="padding:14px 20px 0">People</div><div class="peoplebar">' +
+      people.items.map(u => '<button class="person" data-go="#/user/' + esc(u.login) + '"><img src="' + esc(u.avatar_url) + '" alt=""><span>' + esc(u.login) + '</span></button>').join('') +
+      '</div></div>';
+  }
+  const sorted = sortItems(RS.items, 'repos');
+  /* the wrapper has no background of its own - it only lets the cards lay out
+     two-up on a laptop, and it keeps the list wrapper-free on phones */
+  if (sorted.length) html += '<div class="repogrid">' + sorted.map(repoRow).join('') + '</div>';
+  else html += '<div class="card empty">' + (RS.q ? 'No results for "' + esc(RS.q) + '"' : (RS.mode === 'discover' ? 'Nothing trending right now.' : 'Nothing here yet.')) + '</div>';
+  list.innerHTML = html;
+}
+/* server-side sort for repo SEARCHES, mapped from the selected sort */
+function searchSortParams() {
+  const s = normSort('repos', LS.get('sort.repos', 'best'));
+  if (s === 'stars') return '&sort=stars&order=desc';
+  if (s === 'sasc') return '&sort=stars&order=asc';
+  if (s === 'forks') return '&sort=forks&order=desc';
+  if (s === 'fasc') return '&sort=forks&order=asc';
+  if (s === 'uasc') return '&sort=updated&order=asc';
+  if (s === 'best') return '';
+  return '&sort=updated&order=desc';
+}
+/* ================= deep + fuzzy repository search =================
+   Three things make a repo "unfindable" with a plain query:
+   1. the request was sent with &sort=updated, which buries a small repo
+      behind thousands of recently pushed ones even for an exact name;
+   2. GitHub's search index lags - a brand new public repo can take a while
+      to appear at all;
+   3. a plain query is matched loosely, so an exact name can rank below
+      unrelated popular repos.
+   So a search now resolves owner/name directly, asks for the exact name,
+   asks broadly, adds the owner's repos when the term looks like a user,
+   and finally ranks everything locally by how well it really matches. */
+function fuzzyScore(r, term) {
+  const t = String(term || '').toLowerCase().trim();
+  if (!t) return 0;
+  const name = String(r.name || '').toLowerCase();
+  const full = String(r.full_name || '').toLowerCase();
+  const owner = full.split('/')[0] || '';
+  let s = 0;
+  if (full === t) s += 160;
+  else if (name === t) s += 120;
+  else if (name.startsWith(t)) s += 80;
+  else if (name.includes(t)) s += 50;
+  if (owner === t) s += 70;
+  else if (owner.includes(t)) s += 18;
+  if (full.includes(t) && name !== t && !name.startsWith(t)) s += 22;
+  if (String(r.description || '').toLowerCase().includes(t)) s += 10;
+  if ((r.topics || []).some(x => String(x).toLowerCase().includes(t))) s += 8;
+  s += Math.min(18, Math.log10((r.stargazers_count || 0) + 1) * 4);
+  return s;
+}
+function rankFuzzy(list, term) {
+  return list.map((r, i) => [r, i]).sort((a, b) => {
+    const d = fuzzyScore(b[0], term) - fuzzyScore(a[0], term);
+    return d !== 0 ? d : a[1] - b[1];
+  }).map(x => x[0]);
+}
+async function deepRepoSearch(term, page, sortParams, wantPeople) {
+  const enc = encodeURIComponent(term);
+  const looksLikePath = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/.test(term);
+  const looksLikeUser = /^[A-Za-z0-9._-]+$/.test(term);
+  const [direct, byName, broad, userRepos, people] = await Promise.all([
+    looksLikePath ? api('/repos/' + term, { status: true }).catch(() => null) : Promise.resolve(null),
+    api('/search/repositories?q=' + enc + '+in%3Aname' + (sortParams || '') + '&per_page=30&page=' + page).catch(() => null),
+    api('/search/repositories?q=' + enc + (sortParams || '') + '&per_page=30&page=' + page).catch(() => null),
+    looksLikeUser ? api('/users/' + enc + '/repos?per_page=30&sort=updated').catch(() => null) : Promise.resolve(null),
+    wantPeople ? api('/search/users?q=' + enc + '&per_page=15').catch(() => null) : Promise.resolve(null)
+  ]);
+  const out = [], seen = new Set();
+  const add = list => (list || []).forEach(r => {
+    const k = r && r.full_name;
+    if (k && !seen.has(k)) { seen.add(k); out.push(r); }
+  });
+  if (direct && direct.status === 200 && direct.data && direct.data.full_name) add([direct.data]);
+  add(byName && byName.items);
+  add(broad && broad.items);
+  add(userRepos);
+  /* nothing at all: retry with the longest word alone, which rescues a name
+     typed with extra words or slightly wrong spacing */
+  if (!out.length && /\s/.test(term)) {
+    const longest = term.split(/\s+/).sort((a, b) => b.length - a.length)[0];
+    if (longest.length >= 3) {
+      const loose = await api('/search/repositories?q=' + encodeURIComponent(longest) + '+in%3Aname&per_page=30').catch(() => null);
+      add(loose && loose.items);
+    }
+  }
+  const explicitSort = !!(sortParams && sortParams.indexOf('sort=') !== -1);
+  return { items: explicitSort ? out : rankFuzzy(out, term), people };
+}
+
+async function loadRepos(reset) {
+  const seq = ++RSEQ;
+  const list = $('#repoList'); if (!list) return;
+  if (reset) { RS.page = 1; RS.items = []; list.innerHTML = spinner(); }
+  if (reset && RS.q.length < 2 && RS.mode !== 'discover') {
+    const cd = cached(RS.mode === 'starred' ? '/user/starred?per_page=30&page=1' : '/user/repos?sort=updated&per_page=30&page=1');
+    if (cd && Array.isArray(cd) && cd.length) {
+      cd.forEach(r => repoCache.set(r.full_name, r));
+      RS.items = cd;
+      RS.people = null;
+      paintRepoList(null);
+    }
+  }
+  $('#searchWrap').style.display = '';
+  let data = [], people = null;
+  try {
+    if (RS.mode === 'discover') {
+      if (RS.q.length >= 2) {
+        const res = await deepRepoSearch(RS.q, RS.page, searchSortParams(), false);
+        data = res.items;
+      } else {
+        const q = 'stars%3A%3E10000+pushed%3A%3E' + isoDaysAgo(90);
+        const res = await api('/search/repositories?q=' + q + searchSortParams() + '&per_page=30&page=' + RS.page);
+        data = res.items || [];
+      }
+    } else if (RS.mode === 'starred' && RS.q.length >= 2) {
+      /* searching the Starred tab must look inside what YOU starred - the old
+         code asked for "user:<you>", which searched your own repositories */
+      const all = await api('/user/starred?per_page=100&page=1').catch(() => []);
+      const t = RS.q.toLowerCase();
+      data = rankFuzzy((all || []).filter(r =>
+        String(r.full_name || '').toLowerCase().includes(t) ||
+        String(r.description || '').toLowerCase().includes(t)), RS.q);
+    } else if (RS.q.length >= 2) {
+      const res = await deepRepoSearch(RS.q, RS.page, searchSortParams(), true);
+      data = res.items;
+      people = res.people;
+    } else if (RS.mode === 'starred') {
+      data = await api('/user/starred?per_page=30&page=' + RS.page);
+    } else {
+      data = await api('/user/repos?sort=updated&per_page=30&page=' + RS.page);
+    }
+  } catch (e) { if (seq !== RSEQ) return; list.innerHTML = errCard(e); return; }
+  data.forEach(r => repoCache.set(r.full_name, r));
+  RS.items = reset ? data : RS.items.concat(data);
+  RS.people = people;
+  if (seq !== RSEQ) return;
+  paintRepoList(people);
+  $('#repoMore').hidden = data.length < 30;
+}
+
+/* ================= list sorting (repos, commits, issues) ================= */
+const SORT_OPTIONS = {
+  repos: [['best', 'Best match'], ['stars', 'Most stars'], ['sasc', 'Fewest stars'], ['forks', 'Most forks'], ['fasc', 'Fewest forks'], ['updated', 'Recently updated'], ['uasc', 'Least recently updated'], ['name', 'Name A–Z']],
+  rcommits: [['new', 'Newest'], ['old', 'Oldest'], ['author', 'Author']],
+  hcommits: [['new', 'Newest'], ['old', 'Oldest'], ['repo', 'Repo']],
+  issues: [['updated', 'Recently updated'], ['new', 'Newest'], ['old', 'Oldest'], ['comments', 'Most commented']]
+};
+function sortLabel(kind, key) {
+  const o = (SORT_OPTIONS[kind] || []).find(s => s[0] === key);
+  return o ? o[1] : (SORT_OPTIONS[kind] ? SORT_OPTIONS[kind][0][1] : '');
+}
+/* normalizes sort keys saved by older app versions */
+function normSort(kind, s) {
+  const opts = SORT_OPTIONS[kind];
+  if (opts.some(o => o[0] === s)) return s;
+  if (kind === 'repos' && (s === 'pushed' || s === 'created')) return 'updated';
+  return opts[0][0];
+}
+/* GitHub-style "Sort: …" dropdown button */
+function sortRowHTML(kind) {
+  const cur = normSort(kind, LS.get('sort.' + kind, SORT_OPTIONS[kind][0][0]));
+  return '<button class="btn ghost" data-sort="' + kind + '" style="margin:0 0 12px;width:100%;display:flex;justify-content:space-between;align-items:center">' +
+    '<span class="sortlbl">Sort: ' + sortLabel(kind, cur) + '</span>' +
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" style="width:18px;height:18px"><polyline points="6 9 12 15 18 9"/></svg></button>';
+}
+function openSortSheet(kind, redo) {
+  const cur = normSort(kind, LS.get('sort.' + kind, SORT_OPTIONS[kind][0][0]));
+  openSheet('<div class="sheethead"><b>Sort by</b><button class="iconbtn" data-act="closesheet">' + SVG.x + '</button></div>' +
+    '<div class="card" style="padding:4px 0">' +
+    SORT_OPTIONS[kind].map(s => '<div class="lrow" data-sel="' + s[0] + '" style="padding:12px 16px">' +
+      '<div class="lmain"><div class="ltitle">' + s[1] + '</div></div>' +
+      (cur === s[0] ? '<div class="istate">' + SVG.check + '</div>' : '') + '</div>').join('') + '</div>');
+  $$('#sheet [data-sel]').forEach(r => r.addEventListener('click', () => {
+    LS.set('sort.' + kind, r.dataset.sel);
+    closeSheet();
+    redo();
+  }));
+}
+function wireSortRow(kind, redo) {
+  const b = document.querySelector('[data-sort="' + kind + '"]');
+  if (!b) return;
+  b.addEventListener('click', () => openSortSheet(kind, redo));
+}
+function commitDate(x) { return (x && x.commit && x.commit.author && x.commit.author.date) || (x && x.date) || ''; }
+function commitAuthor(x) { return (x && x.author && x.author.login) || (x && x.commit && x.commit.author && x.commit.author.name) || ''; }
+function sortItems(items, kind) {
+  const s = normSort(kind, LS.get('sort.' + kind, SORT_OPTIONS[kind][0][0]));
+  const arr = (items || []).slice();
+  const byName = (a, b) => String(a || '').localeCompare(String(b || ''), undefined, { sensitivity: 'base' });
+  if (kind === 'repos') {
+    if (s === 'best') return arr;
+    if (s === 'name') arr.sort((a, b) => byName(a.name, b.name));
+    else if (s === 'stars' || s === 'sasc') { arr.sort((a, b) => (a.stargazers_count || 0) - (b.stargazers_count || 0)); if (s === 'stars') arr.reverse(); }
+    else if (s === 'forks' || s === 'fasc') { arr.sort((a, b) => (a.forks_count || 0) - (b.forks_count || 0)); if (s === 'forks') arr.reverse(); }
+    else if (s === 'updated' || s === 'uasc') { arr.sort((a, b) => new Date(a.pushed_at || a.updated_at || 0) - new Date(b.pushed_at || b.updated_at || 0)); if (s === 'updated') arr.reverse(); }
+  } else if (kind === 'rcommits') {
+    if (s === 'old') arr.sort((a, b) => new Date(commitDate(a) || 0) - new Date(commitDate(b) || 0));
+    else if (s === 'author') arr.sort((a, b) => byName(commitAuthor(a), commitAuthor(b)));
+    else arr.sort((a, b) => new Date(commitDate(b) || 0) - new Date(commitDate(a) || 0));
+  } else if (kind === 'hcommits') {
+    if (s === 'old') arr.sort((a, b) => new Date(a.date || 0) - new Date(b.date || 0));
+    else if (s === 'repo') arr.sort((a, b) => byName(a.repo, b.repo));
+    else arr.sort((a, b) => new Date(b.date || 0) - new Date(a.date || 0));
+  } else if (kind === 'issues') {
+    if (s === 'new') arr.sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0));
+    else if (s === 'old') arr.sort((a, b) => new Date(a.created_at || 0) - new Date(b.created_at || 0));
+    else if (s === 'comments') arr.sort((a, b) => (b.comments || 0) - (a.comments || 0));
+    else arr.sort((a, b) => new Date(b.updated_at || 0) - new Date(a.updated_at || 0));
+  }
+  return arr;
+}
+
+/* true when the signed-in user can push to this repo (owner or collaborator) */
+const PUSH_CACHE = {};
+async function canPushRepo(o, n) {
+  const full = o + '/' + n;
+  if (full in PUSH_CACHE) return PUSH_CACHE[full];
+  let r = repoCache.get(full);
+  if (!r || !r.permissions) {
+    try { r = await api('/repos/' + full); } catch (e) { r = null; }
+  }
+  PUSH_CACHE[full] = !!(r && r.permissions && r.permissions.push);
+  return PUSH_CACHE[full];
+}
+
+/* ================= views: repo detail ================= */
+async function renderRepo(o, n) {
+  const seq = ++RSEQ;
+  const full = o + '/' + n;
+  let r = cached('/repos/' + full) || null;
+  if (r) api('/repos/' + full).then(fr => { if (fr && fr.full_name) repoCache.set(fr.full_name, fr); }).catch(() => {});
+  if (!r) { try { r = await api('/repos/' + full); } catch (e) { if (seq !== RSEQ) return; view().innerHTML = errCard(e); return; } }
+  repoCache.set(r.full_name, r);
+  let html = '<div class="card">' +
+    '<div class="rcrow"><div class="rcname">' + esc(r.name) + '</div>' +
+    '<button class="pinbtn ' + (isPinned(r.full_name) ? 'pinned' : '') + '" data-pinbtn="' + esc(r.full_name) + '" aria-label="pin">' + SVG.star + '</button></div>' +
+    '<div class="chips"><span class="chip">' + (r.private ? 'Private' : 'Public') + '</span>' +
+    (r.fork ? '<span class="chip">Fork</span>' : '') + (r.archived ? '<span class="chip warn">Archived</span>' : '') +
+    (r.default_branch ? '<span class="chip">' + esc(r.default_branch) + '</span>' : '') + '</div>' +
+    (r.description ? '<p class="rcdesc">' + esc(r.description) + '</p>' : '') +
+    (r.topics && r.topics.length ? '<div class="chips">' + r.topics.slice(0, 8).map(t => '<span class="chip pr">' + esc(t) + '</span>').join('') + '</div>' : '') +
+    '<div class="rcmeta">' + SVG.star + ' ' + nf(r.stargazers_count) + ' · ' + SVG.fork + ' ' + nf(r.forks_count) +
+    (r.language ? ' · <span class="dot" style="background:' + langColor(r.language) + '"></span>' + esc(r.language) : '') + '</div>' +
+    '<div class="bigstats">' +
+    '<div class="bstat"><b>' + nf(r.open_issues_count) + '</b><span>issues</span></div>' +
+    '<div class="bstat"><b>' + nf(r.watchers_count) + '</b><span>watchers</span></div>' +
+    '<div class="bstat"><b>' + tAgo(r.pushed_at) + '</b><span>last push</span></div></div></div>';
+  html += '<div class="card metarow" id="metaRow">' + spinner(true) + '</div>';
+  html += '<div class="card"><div class="actionrow">' +
+    '<button class="btn ghost" id="actStar">' + SVG.star + '<span>Star</span></button>' +
+    '<button class="btn ghost" id="actWatch">' + SVG.eye + '<span>Watch</span></button>' +
+    '<button class="btn ghost" id="actFork">' + SVG.fork + '<span>Fork</span></button>' +
+    '<button class="btn ghost" data-act="ext" data-url="' + esc(r.html_url) + '">' + SVG.ext + '<span>Open</span></button>' +
+    '</div></div>';
+  if (r.permissions && r.permissions.push) {
+    html += '<div class="card" style="display:flex;gap:8px"><button class="btn ghost" id="editRepoBtn" style="flex:1">Edit repository</button><button class="btn ghost" data-go="#/repo/' + full + '/settings" style="flex:1">Settings</button></div>';
+  }
+  html += '<div class="seg tabs"><a class="segb on" href="#/repo/' + full + '">Readme</a>' +
+    '<a class="segb" href="#/repo/' + full + '/files">Files</a>' +
+    '<a class="segb" href="#/repo/' + full + '/commits">Commits</a>' +
+    '<a class="segb" href="#/repo/' + full + '/issues">Issues</a>' +
+    '<a class="segb" href="#/repo/' + full + '/pulls">Pull requests</a>' +
+    '<a class="segb" href="#/repo/' + full + '/actions">Actions</a>' +
+    '<a class="segb" href="#/repo/' + full + '/security">Security</a>' +
+    '<a class="segb" href="#/repo/' + full + '/insights">Insights</a></div>';
+  html += '<div id="readmeWrap">' + spinner() + '</div>';
+  html += '<div id="langWrap"></div>';
+  if (seq !== RSEQ) return;
+  view().innerHTML = html;
+  // contributors + latest release
+  const [contribs, release] = await Promise.all([
+    api('/repos/' + full + '/contributors?per_page=9').catch(() => null),
+    api('/repos/' + full + '/releases/latest').catch(() => null)
+  ]);
+  let meta = '<div class="mrow"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>' +
+    '<div class="lmain"><div class="ltitle">Contributors</div>' +
+    (contribs && contribs.length ? '' : '<div class="lsub">none listed</div>') + '</div>' +
+    '<div class="avatars">' + (contribs || []).map(c => '<img data-go="#/user/' + esc(c.login) + '" src="' + esc(c.avatar_url) + '" alt="' + esc(c.login) + '" title="' + esc(c.login) + '">').join('') + '</div></div>';
+  if (release && release.tag_name) {
+    meta += '<div class="mrow" data-go="#/repo/' + full + '/releases">' + SVG.tag +
+      '<div class="lmain"><div class="ltitle">Releases · latest ' + esc(release.tag_name) + '</div>' +
+      '<div class="lsub">' + tAgo(release.published_at) + (release.author ? ' · by ' + esc(release.author.login) : '') + ' — tap to view and download</div></div></div>';
+  } else {
+    meta += '<div class="mrow" data-go="#/repo/' + full + '/releases">' + SVG.tag +
+      '<div class="lmain"><div class="ltitle">Releases</div>' +
+      '<div class="lsub">view all releases</div></div></div>';
+  }
+  meta += '<div class="mrow" data-act="clone" data-full="' + esc(full) + '">' + SVG.code +
+    '<div class="lmain"><div class="ltitle">Clone</div>' +
+    '<div class="lsub">HTTPS / SSH URLs and ZIP download</div></div></div>';
+  meta += '<div class="mrow" data-act="deployments" data-full="' + esc(full) + '">' + SVG.ext +
+    '<div class="lmain"><div class="ltitle">Deployments</div>' +
+    '<div class="lsub">Deployment history and environments</div></div></div>';
+  const mr = $('#metaRow'); if (mr) mr.innerHTML = meta;
+  // repo actions: star / watch / fork
+  const starBtn = $('#actStar'), watchBtn = $('#actWatch'), forkBtn = $('#actFork');
+  const editBtn = $('#editRepoBtn');
+  if (editBtn) editBtn.addEventListener('click', () => editRepoSheet(o, n, r));
+  if (starBtn) {
+    api('/user/starred/' + full, { status: true }).then(s => {
+      if (s && s.status === 204) { starBtn.classList.add('on'); starBtn.querySelector('span').textContent = 'Starred'; }
+    }).catch(() => {});
+    starBtn.addEventListener('click', async () => {
+      const on = starBtn.classList.contains('on');
+      try {
+        await api('/user/starred/' + full, { method: on ? 'DELETE' : 'PUT' });
+        starBtn.classList.toggle('on', !on);
+        starBtn.querySelector('span').textContent = on ? 'Star' : 'Starred';
+        toast(on ? 'Unstarred ' + n : 'Starred ' + n);
+      } catch (e) { toast('Failed: ' + e.message); }
+    });
+  }
+  if (watchBtn) {
+    api('/repos/' + full + '/subscription', { status: true }).then(s => {
+      if (s && s.status === 200) { watchBtn.classList.add('on'); watchBtn.querySelector('span').textContent = 'Watching'; }
+    }).catch(() => {});
+    watchBtn.addEventListener('click', async () => {
+      const on = watchBtn.classList.contains('on');
+      try {
+        await api('/repos/' + full + '/subscription', { method: on ? 'DELETE' : 'PUT', body: on ? undefined : JSON.stringify({ subscribed: true }) });
+        watchBtn.classList.toggle('on', !on);
+        watchBtn.querySelector('span').textContent = on ? 'Watch' : 'Watching';
+        toast(on ? 'Stopped watching ' + n : 'Watching ' + n);
+      } catch (e) { toast('Failed: ' + e.message); }
+    });
+  }
+  if (forkBtn) {
+    forkBtn.addEventListener('click', async () => {
+      if (!window.confirm('Fork ' + full + ' to your account?')) return;
+      try {
+        const f = await api('/repos/' + full + '/forks', { method: 'POST' });
+        toast('Forked to ' + f.full_name);
+        location.hash = '#/repo/' + f.full_name;
+      } catch (e) { toast('Failed: ' + e.message); }
+    });
+  }
+  api('/repos/' + full + '/languages').then(langs => {
+    const lw = $('#langWrap'); if (lw && langs && Object.keys(langs).length) lw.innerHTML = langBars(langs);
+  }).catch(() => {});
+  // readme
+  try {
+    const md = await api('/repos/' + full + '/readme', { accept: 'application/vnd.github.html', text: true });
+    const rw = $('#readmeWrap');
+    if (rw && seq === RSEQ) { rw.innerHTML = '<div class="card md">' + fixMd(md, full) + '</div>'; inlineRepoImages(rw); }
+  } catch (e) {
+    if (seq !== RSEQ) return;
+    const rw = $('#readmeWrap');
+    if (rw) {
+      rw.innerHTML = '<div class="card empty">No README found.<div style="margin-top:14px"><button class="btn sm ghost" id="mkReadmeBtn" style="min-width:170px">Create README</button></div></div>';
+      const mrb = $('#mkReadmeBtn');
+      if (mrb) mrb.addEventListener('click', () => addFileSheet(o, n, '', 'README.md'));
+    }
+  }
+}
+
+function wireFileActions(o, n, path) {
+  if (!$('#addFileBtn')) return;
+  $('#addFileBtn').addEventListener('click', () => addFileSheet(o, n, path));
+  const upi = $('#upInput');
+  $('#upFileBtn').addEventListener('click', () => {
+    if (window.OneGit && window.OneGit.pickFiles) {
+      folderCtx = { o, n, dir: path || '', jid: null, kind: 'files' };
+      try { window.OneGit.pickFiles(); upProgShow('Upload files'); upProgUpdate('Choose files…', 0); return; }
+      catch (e) { folderCtx = null; }
+    }
+    upi.click();
+  });
+  const udb = $('#upDirBtn');
+  if (udb) udb.addEventListener('click', () => {
+    if (!(window.OneGit && window.OneGit.pickFolder)) { toast('Folder upload is not available'); return; }
+    folderCtx = { o, n, dir: path || '', jid: null, kind: 'folder' };
+    try { window.OneGit.pickFolder(); upProgShow('Upload folder'); upProgUpdate('Scanning folder…', 0); } catch (e) { folderCtx = null; toast('Could not open the folder picker'); }
+  });
+  upi.addEventListener('change', async () => {
+    const files = Array.from(upi.files || []);
+    if (!files.length) return;
+    const items = [];
+    for (const f of files) {
+      try { items.push({ path: f.name, b64: await fileToB64(f) }); }
+      catch (e) { toast('Could not read ' + f.name); }
+    }
+    upi.value = '';
+    if (!items.length) return;
+    const def = items.length === 1 ? 'Upload ' + items[0].path : 'Upload ' + items.length + ' files';
+    commitMsgSheet('Upload ' + items.length + ' file' + (items.length === 1 ? '' : 's'), def, async msg => {
+      upProgShow('Uploading files');
+      upProgUpdate('Reading files…', 5);
+      try {
+        await commitMany(o, n, items, path || '', msg,
+          (done, total) => upProgUpdate('Committing ' + done + ' / ' + total, done / total * 100));
+        upProgUpdate('Complete — ' + items.length + ' file' + (items.length === 1 ? '' : 's') + ' in one commit', 100);
+        setTimeout(upProgHide, 3000);
+        try { if (window.OneGit && window.OneGit.notify) window.OneGit.notify('Upload complete', items.length + ' file' + (items.length === 1 ? '' : 's') + ' uploaded to ' + o + '/' + n + ' in a single commit'); } catch (e) {}
+        renderFiles(o, n, path);
+      } catch (e) { upProgHide(); toast('Failed: ' + e.message); }
+    });
+  });
+}
+
+async function renderFiles(o, n, path) {
+  const seq = ++RSEQ;
+  const full = o + '/' + n;
+  if (seq !== RSEQ) return;
+  view().innerHTML = spinner();
+  const canWrite = await canPushRepo(o, n);
+  if (seq !== RSEQ) return;
+  /* file write actions only for repos you can push to */
+  const actRow = canWrite ? '<div style="display:flex;gap:8px;margin-bottom:12px"><button class="btn ghost" id="addFileBtn" style="flex:1">Add file</button><button class="btn ghost" id="upFileBtn" style="flex:1">Upload files</button><button class="btn ghost" id="upDirBtn" style="flex:1">Upload folder</button></div>' : '';
+  let items;
+  try { items = await api('/repos/' + full + '/contents/' + (path ? encodeURIComponent(path).replace(/%2F/g, '/') : '')); }
+  catch (e) {
+    if (seq !== RSEQ) return;
+    if (/is empty/i.test(e.message || '')) {
+      view().innerHTML = actRow + '<input type="file" id="upInput" multiple hidden><div class="card empty">This repository is empty \u2014 add your first file to get started.</div>';
+      wireFileActions(o, n, path);
+      return;
+    }
+    view().innerHTML = errCard(e); return;
+  }
+  if (!Array.isArray(items)) { view().innerHTML = '<div class="card empty">Not a folder.</div>'; return; }
+  items.sort((a, b) => (a.type === b.type ? a.name.localeCompare(b.name) : (a.type === 'dir' ? -1 : 1)));
+  let html = path ? '<div class="card crumb">/' + esc(path) + '</div>' : '';
+  html += actRow;
+  html += '<input type="file" id="upInput" multiple hidden>';
+  html += '<div class="card list">';
+  if (path) {
+    const parent = path.split('/').slice(0, -1).join('/');
+    html += '<div class="lrow" data-go="#/repo/' + full + '/files' + (parent ? '/' + parent : '') + '">' + SVG.folder + '<div class="lmain"><div class="ltitle">..</div></div></div>';
+  }
+  items.forEach(it => {
+    if (it.type === 'dir') html += '<div class="lrow" data-go="#/repo/' + full + '/files/' + it.path + '">' + SVG.folder + '<div class="lmain"><div class="ltitle">' + esc(it.name) + '</div></div></div>';
+    else html += '<div class="lrow" data-act="openfile" data-repo="' + esc(full) + '" data-file="' + esc(it.path) + '">' + SVG.file + '<div class="lmain"><div class="ltitle">' + esc(it.name) + '</div><div class="lsub">' + fmtSize(it.size) + '</div></div>' +
+      /* download straight from the list, without opening the file first */
+      '<button class="iconbtn" data-act="apidl" data-owner="' + esc(o) + '" data-repo="' + esc(n) + '" data-path="' + esc(it.path) + '" data-name="' + esc(it.name) + '" aria-label="download ' + esc(it.name) + '">' + SVG.dl + '</button></div>';
+  });
+  html += '</div>';
+  if (seq !== RSEQ) return;
+  view().innerHTML = html;
+  wireFileActions(o, n, path);
+  let lpTimer = null, lpFired = false;
+  view().querySelectorAll('[data-act="openfile"]').forEach(row => {
+    row.addEventListener('pointerdown', () => {
+      lpFired = false;
+      clearTimeout(lpTimer);
+      lpTimer = setTimeout(() => {
+        lpFired = true;
+        try { if (navigator.vibrate) navigator.vibrate(25); } catch (er) {}
+        confirmDeleteFile(row.dataset.repo, row.dataset.file);
+      }, 550);
+    });
+    const cancel = () => clearTimeout(lpTimer);
+    row.addEventListener('pointerup', cancel);
+    row.addEventListener('pointerleave', cancel);
+    row.addEventListener('pointercancel', cancel);
+    row.addEventListener('click', e => { if (lpFired) { e.stopImmediatePropagation(); e.preventDefault(); lpFired = false; } }, true);
+  });
+}
+
+async function renderCommits(o, n) {
+  const seq = ++RSEQ;
+  const full = o + '/' + n;
+  if (seq !== RSEQ) return;
+  view().innerHTML = spinner();
+  const midnight = new Date(); midnight.setHours(0, 0, 0, 0);
+  const res = await Promise.allSettled([
+    api('/repos/' + full + '/commits?per_page=30'),
+    apiCount('/repos/' + full + '/commits'),
+    apiCount('/repos/' + full + '/commits?since=' + midnight.toISOString())
+  ]);
+  if (seq !== RSEQ) return;
+  if (res[0].status !== 'fulfilled') { view().innerHTML = errCard(res[0].reason); return; }
+  const items = res[0].value;
+  const total = res[1].status === 'fulfilled' ? res[1].value : null;
+  const today = res[2].status === 'fulfilled' ? res[2].value : null;
+  let html = '';
+  if (total !== null || today !== null) html += '<div class="card commitstats" style="margin:0 0 14px">' +
+    (total !== null ? '<div class="cstat total">' + nf(total) + '<span>Total commits</span></div>' : '') +
+    (today !== null ? '<div class="cstat today">' + nf(today) + '<span>Today</span></div>' : '') + '</div>';
+  html += sortRowHTML('rcommits');
+  const sorted = sortItems(items, 'rcommits');
+  html += sorted.length ? '<div class="card list">' + sorted.map(x => commitRow(x, full)).join('') + '</div>' : '<div class="card empty">No commits found.</div>';
+  view().innerHTML = html;
+  wireSortRow('rcommits', () => renderCommits(o, n));
+  wireCommitRows();
+}
+/* counts results of a LIST endpoint exactly via the Link header (per_page=1 trick) */
+async function apiCount(path) {
+  const headers = { 'Accept': 'application/vnd.github+json' };
+  if (TOKEN) headers.Authorization = 'Bearer ' + TOKEN;
+  const res = await fetch('https://api.github.com' + path + (path.indexOf('?') >= 0 ? '&' : '?') + 'per_page=1', { headers, cache: 'no-store' });
+  if (!res.ok) throw new Error('HTTP ' + res.status);
+  const link = res.headers.get('Link') || '';
+  const m = link.match(/[?&]page=(\d+)>; rel="last"/);
+  if (m) return +m[1];
+  const arr = await res.json().catch(() => null);
+  return Array.isArray(arr) ? arr.length : 0;
+}
+
+/* ---- global Commits tab: recent commits across all your repos ---- */
+function commitTabRow(x) {
+  return '<div class="lrow" data-go="#/commit/' + esc(x.repo) + '/' + x.sha + '" data-repo="' + esc(x.repo) + '" data-sha="' + esc(x.sha) + '">' +
+    (x.av ? '<img class="cav" src="' + esc(x.av) + '" alt="">' : SVG.commit) +
+    '<div class="lmain"><div class="ltitle">' + esc(x.msg) + '</div>' +
+    '<div class="lsub">' + esc(x.repo) + ' \u00b7 ' + tAgo(x.date) + ' \u00b7 <span class="chip">' + esc(String(x.sha).slice(0, 7)) + '</span></div></div></div>';
+}
+async function renderCommitsHome() {
+  const seq = ++RSEQ;
+  const cached = LS.get('c.allcomm', null);
+  let lastShown = cached && cached.length ? cached : [];
+  const paint = items => {
+    lastShown = items || [];
+    if (seq !== RSEQ) return;
+    view().innerHTML = sortRowHTML('hcommits') +
+      (lastShown.length ? '<div class="card list">' + sortItems(lastShown, 'hcommits').map(commitTabRow).join('') + '</div>' : '<div class="card empty">No commits found yet.</div>');
+    wireCommitRows();
+    wireSortRow('hcommits', () => paint(lastShown));
+  };
+  if (cached && cached.length) paint(cached); else view().innerHTML = spinner();
+  const query = 'query{viewer{repositories(first:100,orderBy:{field:PUSHED_AT,direction:DESC},affiliations:OWNER,isFork:false){nodes{nameWithOwner defaultBranchRef{target{... on Commit{history(first:10){edges{node{oid messageHeadline committedDate author{name user{login avatarUrl(size:60)}}}}}}}}}}}}';
+  try {
+    const r = await api('/graphql', { method: 'POST', body: JSON.stringify({ query }) });
+    const nodes = (r && r.data && r.data.viewer && r.data.viewer.repositories.nodes) || [];
+    const items = [];
+    nodes.forEach(nd => ((nd.defaultBranchRef && nd.defaultBranchRef.target && nd.defaultBranchRef.target.history ? nd.defaultBranchRef.target.history.edges : []) || []).forEach(e => {
+      const c = e && e.node; if (!c) return;
+      items.push({ repo: nd.nameWithOwner, sha: c.oid, msg: c.messageHeadline || '(no message)', date: c.committedDate,
+        av: c.author && c.author.user ? c.author.user.avatarUrl : '' });
+    }));
+    items.sort((a, b) => new Date(b.date || 0) - new Date(a.date || 0));
+    LS.set('c.allcomm', items.slice(0, 300));
+    paint(items.slice(0, 300));
+  } catch (e) { if (seq !== RSEQ) return; if (!cached || !cached.length) view().innerHTML = errCard(e); }
+}
+
+/* long-press support on commit rows */
+function wireCommitRows() {
+  $$('#view .lrow[data-go^="#/commit/"]').forEach(el => {
+    let t = null, fired = false;
+    const start = () => { fired = false; clearTimeout(t); t = setTimeout(() => { fired = true; try { navigator.vibrate && navigator.vibrate(15); } catch (e) {} commitOptionsSheet(el.dataset.repo, el.dataset.sha, (el.querySelector('.ltitle') || {}).textContent || ''); }, 480); };
+    const stop = () => clearTimeout(t);
+    el.addEventListener('touchstart', start, { passive: true });
+    el.addEventListener('touchmove', stop, { passive: true });
+    el.addEventListener('touchend', e => { stop(); if (fired) e.preventDefault(); }, false);
+    el.addEventListener('touchcancel', stop);
+    el.addEventListener('contextmenu', e => { if (fired) e.preventDefault(); });
+    el.addEventListener('click', e => { if (fired) { e.stopImmediatePropagation(); e.preventDefault(); setTimeout(() => fired = false, 500); } }, true);
+  });
+}
+
+/* long-press sheet: view / revert / rollback any commit */
+async function commitOptionsSheet(full, sha, title) {
+  if (!full || !sha) return;
+  const parts = full.split('/');
+  const o = parts[0], n = parts.slice(1).join('/');
+  openSheet('<div class="sheethead"><b>' + esc(title || String(sha).slice(0, 7)) + '</b><button class="iconbtn" data-act="closesheet">' + SVG.x + '</button></div>' +
+    '<p class="dim" style="margin:0 4px 4px">' + esc(full) + ' \u00b7 <span class="chip">' + esc(String(sha).slice(0, 7)) + '</span></p>' +
+    '<button class="btn primary btnblock" id="coView">View commit</button>' +
+    '<button class="btn ghost btnblock" id="coRevert" style="margin-top:8px">Revert changes</button>' +
+    '<button class="btn danger btnblock" id="coRollback" style="margin-top:8px">Rollback \u2014 remove commits</button>');
+  $('#coView').addEventListener('click', () => { closeSheet(); location.hash = '#/commit/' + full + '/' + sha; });
+  $('#coRevert').addEventListener('click', async () => {
+    const b = $('#coRevert');
+    b.textContent = 'Loading\u2026';
+    try {
+      const c = await api('/repos/' + full + '/commits/' + sha);
+      if (!c.files || !c.files.length) throw new Error('no file changes to revert');
+      if (!c.parents || !c.parents.length) throw new Error('the first commit cannot be reverted');
+      b.textContent = 'Reverting\u2026';
+      await doRevertCommit(o, n, c);
+      closeSheet();
+      toast('Reverted \u2014 a new commit undoes these changes');
+      try { route(); } catch (e) {}
+    } catch (e) { b.textContent = 'Revert changes'; toast('Failed: ' + e.message); }
+  });
+  $('#coRollback').addEventListener('click', async () => {
+    const b = $('#coRollback');
+    b.textContent = 'Checking\u2026';
+    try {
+      const c = await api('/repos/' + full + '/commits/' + sha);
+      if (!c.parents || !c.parents.length) throw new Error('nothing before this commit to roll back to');
+      const repo = await api('/repos/' + full);
+      const branch = repo.default_branch || 'main';
+      const list = await api('/repos/' + full + '/commits?per_page=100');
+      const idx = list.findIndex(x => x.sha === sha);
+      if (idx < 0) throw new Error('this commit is not on ' + branch);
+      b.textContent = 'Rollback';
+      rollbackSheet(o, n, c, branch, idx + 1);
+    } catch (e) { b.textContent = 'Rollback \u2014 remove commits'; toast('Failed: ' + e.message); }
+  });
+}
+
+async function renderCommit(o, n, sha) {
+  const seq = ++RSEQ;
+  const full = o + '/' + n;
+  if (seq !== RSEQ) return;
+  view().innerHTML = spinner();
+  let c;
+  try { c = await api('/repos/' + full + '/commits/' + sha); }
+  catch (e) { if (seq !== RSEQ) return; view().innerHTML = errCard(e); return; }
+  const lines = (c.commit && c.commit.message ? c.commit.message : '').split('\n');
+  const title = lines[0];
+  const rest = lines.slice(1).join('\n').trim();
+  const who = c.author ? c.author.login : (c.commit && c.commit.author ? c.commit.author.name : 'unknown');
+  const av = c.author ? c.author.avatar_url : '';
+  let html = '<div class="card"><div class="crow">' + (av ? '<img class="cav" src="' + esc(av) + '" alt="">' : SVG.commit) +
+    '<b data-go="#/user/' + esc(who) + '">' + esc(who) + '</b><span class="chip">' + c.sha.slice(0, 7) + '</span></div>' +
+    '<div class="ihtitle">' + esc(title) + '</div>' +
+    (rest ? '<p class="rcdesc" style="-webkit-line-clamp:8">' + esc(rest) + '</p>' : '') +
+    '<div class="ihmeta">' + tAgo(c.commit && c.commit.author ? c.commit.author.date : '') + (c.commit && c.commit.verification && c.commit.verification.verified ? ' · verified' : '') + '</div>';
+  if (c.stats) {
+    html += '<div class="commitstats">' +
+      '<div class="cstat add">+' + nf(c.stats.additions) + '<span>additions</span></div>' +
+      '<div class="cstat del">-' + nf(c.stats.deletions) + '<span>deletions</span></div>' +
+      '<div class="cstat total">' + nf(c.stats.total) + '<span>changes</span></div></div>';
+  }
+  if ((c.files && c.files.length) || (c.parents && c.parents.length && c.parents[0].sha)) {
+    html += '<div class="actionrow" style="margin-top:12px">';
+    if (c.files && c.files.length) html += '<button class="btn" id="cRevert">Revert changes</button>';
+    if (c.parents && c.parents.length && c.parents[0].sha) html += '<button class="btn danger" id="cRollback">Rollback</button>';
+    html += '</div>';
+  }
+  html += '</div>';
+  html += '<h2 class="sect">Changed files (' + (c.files ? c.files.length : 0) + ')</h2>';
+  if (!c.files || !c.files.length) html += '<div class="card empty">No file changes listed.</div>';
+  else c.files.slice(0, 40).forEach(f => {
+    html += '<div class="card"><div class="filehead" data-go="#/commitfile/' + full + '/' + c.sha + '/' + encodeURIComponent(f.filename) + '">' + SVG.file +
+      '<b style="font-size:13px;word-break:break-all">' + esc(f.filename) + '</b>' +
+      (f.status === 'added' ? '<span class="chip add">added</span>' : f.status === 'removed' ? '<span class="chip del">removed</span>' : f.status === 'renamed' ? '<span class="chip">renamed</span>' : '<span class="chip">modified</span>') + '</div>';
+    if (f.patch) {
+      const ls = f.patch.split('\n').slice(0, 400);
+      html += '<div class="patchpre">' + ls.map(l => {
+        let cls = '';
+        if (l.startsWith('+')) cls = 'add'; else if (l.startsWith('-')) cls = 'del'; else if (l.startsWith('@@')) cls = 'hh';
+        return '<div class="pline ' + cls + '">' + esc(l || ' ') + '</div>';
+      }).join('') + '</div>';
+    }
+    html += '</div>';
+  });
+  if (seq !== RSEQ) return;
+  view().innerHTML = html;
+  const rv = $('#cRevert');
+  if (rv) rv.addEventListener('click', async () => {
+    rv.textContent = 'Reverting\u2026';
+    try {
+      await doRevertCommit(o, n, c);
+      toast('Reverted \u2014 a new commit undoes these changes');
+      location.hash = '#/repo/' + full + '/commits';
+    } catch (e) { rv.textContent = 'Revert changes'; toast('Failed: ' + e.message); }
+  });
+  const rb = $('#cRollback');
+  if (rb) rb.addEventListener('click', async () => {
+    rb.textContent = 'Checking\u2026';
+    let cnt = -1, branch = '';
+    try {
+      const repo = await api('/repos/' + full);
+      branch = repo.default_branch || 'main';
+      const list = await api('/repos/' + full + '/commits?per_page=100');
+      const idx = list.findIndex(x => x.sha === c.sha);
+      cnt = idx < 0 ? -2 : idx + 1;
+    } catch (e) {}
+    rb.textContent = 'Rollback';
+    if (cnt === -2) { toast('This commit is not on ' + (branch || 'the default branch') + ' \u2014 rollback is not available'); return; }
+    if (cnt < 1) { toast('Could not check the branch \u2014 try again'); return; }
+    rollbackSheet(o, n, c, branch, cnt);
+  });
+}
+
+/* revert = new commit that restores the parent state for every path this commit touched */
+async function doRevertCommit(o, n, c) {
+  const repo = await api('/repos/' + o + '/' + n);
+  const branch = repo.default_branch || 'main';
+  const head = await api('/repos/' + o + '/' + n + '/git/ref/heads/' + branch);
+  const headCommit = await api('/repos/' + o + '/' + n + '/git/commits/' + head.object.sha);
+  const pCommit = await api('/repos/' + o + '/' + n + '/git/commits/' + c.parents[0].sha);
+  const pTree = await api('/repos/' + o + '/' + n + '/git/trees/' + pCommit.tree.sha + '?recursive=1');
+  const byPath = {};
+  (pTree.tree || []).forEach(t => { if (t.type === 'blob') byPath[t.path] = t; });
+  const tree = [];
+  (c.files || []).slice(0, 300).forEach(f => {
+    if (f.status === 'renamed') {
+      const old = byPath[f.previous_filename];
+      tree.push({ path: f.previous_filename, mode: old ? old.mode : '100644', type: 'blob', sha: old ? old.sha : null });
+      tree.push({ path: f.filename, mode: '100644', type: 'blob', sha: null });
+    } else {
+      const e = byPath[f.filename];
+      tree.push({ path: f.filename, mode: e ? e.mode : '100644', type: 'blob', sha: e ? e.sha : null });
+    }
+  });
+  if (!tree.length) throw new Error('Nothing to revert');
+  const newTree = await api('/repos/' + o + '/' + n + '/git/trees', { method: 'POST', body: JSON.stringify({ base_tree: headCommit.tree.sha, tree }) });
+  const msg = 'Revert "' + (c.commit && c.commit.message ? c.commit.message : '').split('\n')[0] + '"\n\nThis reverts commit ' + c.sha + '.';
+  const nc = await api('/repos/' + o + '/' + n + '/git/commits', { method: 'POST', body: JSON.stringify({ message: msg, tree: newTree.sha, parents: [head.object.sha] }) });
+  await api('/repos/' + o + '/' + n + '/git/refs/heads/' + branch, { method: 'PATCH', body: JSON.stringify({ sha: nc.sha }) });
+}
+
+/* rollback = force-move the branch ref to this commit's parent, dropping it and everything after */
+function rollbackSheet(o, n, c, branch, cnt) {
+  openSheet('<div class="sheethead"><b>Rollback ' + esc(branch) + '</b><button class="iconbtn" data-act="closesheet">' + SVG.x + '</button></div>' +
+    '<p class="dim" style="margin:4px 0 14px">This permanently removes <b>' + cnt + ' commit' + (cnt === 1 ? '' : 's') + '</b> \u2014 the one you are viewing and every commit made after it \u2014 from ' + esc(branch) + '. The changes will be gone. Anyone who already pulled a copy may still have them.</p>' +
+    '<button class="btn danger btnblock" id="rbGo">Remove ' + cnt + ' commit' + (cnt === 1 ? '' : 's') + '</button>');
+  $('#rbGo').addEventListener('click', async () => {
+    const b = $('#rbGo');
+    b.textContent = 'Removing\u2026';
+    try {
+      await api('/repos/' + o + '/' + n + '/git/refs/heads/' + branch, { method: 'PATCH', body: JSON.stringify({ sha: c.parents[0].sha, force: true }) });
+      location.hash = '#/repo/' + o + '/' + n + '/commits';
+      toast('Rolled back \u2014 ' + cnt + ' commit' + (cnt === 1 ? '' : 's') + ' removed');
+    } catch (e) { b.textContent = 'Remove ' + cnt + ' commit' + (cnt === 1 ? '' : 's'); toast('Failed: ' + e.message); }
+  });
+}
+
+/* asks for a custom commit message before an upload commits */
+function commitMsgSheet(title, prefill, onGo, onCancel) {
+  openSheet('<div class="sheethead"><b>' + esc(title) + '</b><button class="iconbtn" id="cmX" aria-label="close">' + SVG.x + '</button></div>' +
+    '<label class="fldlabel">Commit message</label>' +
+    '<input class="fld" id="cmMsg" value="' + esc(prefill) + '" maxlength="200" autocomplete="off" spellcheck="false">' +
+    '<button class="btn primary btnblock" id="cmGo" style="margin-top:16px">Commit</button>');
+  const inp = $('#cmMsg');
+  try { inp.focus(); } catch (e) {}
+  $('#cmX').addEventListener('click', () => { closeSheet(); if (onCancel) onCancel(); });
+  inp.addEventListener('keydown', e => { if (e.key === 'Enter') $('#cmGo').click(); });
+  $('#cmGo').addEventListener('click', () => { const m = inp.value.trim() || prefill; closeSheet(); onGo(m); });
+}
+
+/* full file content at a commit, plus its diff \u2014 GitHub-style "view file" */
+async function renderCommitFile(o, n, sha, path) {
+  const seq = ++RSEQ;
+  const full = o + '/' + n;
+  view().innerHTML = spinner();
+  const res = await Promise.allSettled([
+    api('/repos/' + full + '/commits/' + sha),
+    api('/repos/' + full + '/contents/' + path + '?ref=' + sha)
+  ]);
+  if (seq !== RSEQ) return;
+  const c = res[0].status === 'fulfilled' ? res[0].value : null;
+  const meta = res[1].status === 'fulfilled' ? res[1].value : null;
+  if (!c && !meta) { view().innerHTML = errCard(res[0].reason || res[1].reason); return; }
+  const f = c ? (c.files || []).find(x => x.filename === path) : null;
+  const cmsg = c && c.commit && c.commit.message ? c.commit.message.split('\n')[0] : '';
+  let raw = '';
+  if (meta && typeof meta.content === 'string' && meta.encoding === 'base64') {
+    const b64 = meta.content.replace(/\n/g, '');
+    try { raw = decodeURIComponent(escape(atob(b64))); } catch (e2) { raw = atob(b64); }
+  }
+  const headSha = (c && c.sha) || sha;
+  let html = '<div class="card"><div class="filehead">' + SVG.file +
+    '<b style="font-size:13px;word-break:break-all">' + esc(path) + '</b></div>' +
+    '<div class="ihmeta">at commit ' + headSha.slice(0, 7) + (cmsg ? ' \u00b7 ' + esc(cmsg) : '') +
+    (f ? ' \u00b7 <span class="chip add">+' + nf(f.additions || 0) + '</span> <span class="chip del">-' + nf(f.deletions || 0) + '</span>' : '') + '</div>' +
+    '<div class="seg" style="margin-top:12px"><button class="segb on" id="cfTabFile">File</button><button class="segb" id="cfTabDiff">Changes</button></div></div>';
+  let fileBlock;
+  if (raw) {
+    const MAX = 60000;
+    let shown = raw, cut = false;
+    if (raw.length > MAX) { shown = raw.slice(0, MAX); cut = true; }
+    const ls = shown.split('\n');
+    if (ls.length > 2000) { shown = ls.slice(0, 2000).join('\n'); cut = true; }
+    fileBlock = '<div class="card"><pre class="filepre">' + esc(shown || '(empty file)') + (cut ? '\n\n\u2026 \u2014 truncated for display' : '') + '</pre></div>';
+  } else {
+    fileBlock = '<div class="card empty">' + (f && f.status === 'removed' ? 'This file was deleted in this commit \u2014 no content exists at this commit.' : 'This file cannot be previewed here (binary or too large).') +
+      (meta && meta.download_url ? '<br><button class="btn ghost" style="margin-top:12px" data-act="download" data-url="' + esc(meta.download_url) + '" data-name="' + esc(path.split('/').pop()) + '">Download</button>' : '') + '</div>';
+  }
+  let diffBlock;
+  if (f && f.patch) {
+    const ls = f.patch.split('\n').slice(0, 3000);
+    diffBlock = '<div class="card"><div class="patchpre">' + ls.map(l => {
+      let cls = '';
+      if (l.startsWith('+')) cls = 'add'; else if (l.startsWith('-')) cls = 'del'; else if (l.startsWith('@@')) cls = 'hh';
+      return '<div class="pline ' + cls + '">' + esc(l || ' ') + '</div>';
+    }).join('') + '</div></div>';
+  } else if (f && f.status === 'added') diffBlock = '<div class="card empty">This file was added in this commit \u2014 see the File tab for its full content.</div>';
+  else if (f && f.status === 'removed') diffBlock = '<div class="card empty">This file was deleted in this commit \u2014 there is nothing to show.</div>';
+  else diffBlock = '<div class="card empty">No inline diff available for this file.</div>';
+  html += '<div id="cfFile">' + fileBlock + '</div><div id="cfDiff" style="display:none">' + diffBlock + '</div>';
+  view().innerHTML = html;
+  const tF = $('#cfTabFile'), tD = $('#cfTabDiff');
+  if (tF && tD) {
+    tF.addEventListener('click', () => { tF.classList.add('on'); tD.classList.remove('on'); $('#cfFile').style.display = ''; $('#cfDiff').style.display = 'none'; });
+    tD.addEventListener('click', () => { tD.classList.add('on'); tF.classList.remove('on'); $('#cfFile').style.display = 'none'; $('#cfDiff').style.display = ''; });
+  }
+}
+
+async function renderReleases(o, n) {
+  const seq = ++RSEQ;
+  const full = o + '/' + n;
+  if (seq !== RSEQ) return;
+  view().innerHTML = spinner();
+  const canWrite = await canPushRepo(o, n);
+  if (seq !== RSEQ) return;
+  let items;
+  try { items = await api('/repos/' + full + '/releases?per_page=30'); }
+  catch (e) { if (seq !== RSEQ) return; view().innerHTML = errCard(e); return; }
+  if (!items.length) { view().innerHTML = (canWrite ? '<button class="btn ghost btnblock" id="newRelBtn" style="margin-bottom:12px">New release</button>' : '') + '<div class="card empty">No releases published yet.' + (canWrite ? '<br><span class="dim">Create one above — tag a version, describe it, done.</span>' : '') + '</div><input type="file" id="relUpInput" hidden>'; if (canWrite) $('#newRelBtn').addEventListener('click', () => newReleaseSheet(o, n)); return; }
+  let html = (canWrite ? '<button class="btn ghost btnblock" id="newRelBtn" style="margin-bottom:12px">New release</button>' : '') + '<input type="file" id="relUpInput" hidden>';
+  items.forEach(rl => {
+    html += '<div class="card">' +
+      '<div class="rcrow"><div class="rcname">' + esc(rl.name || rl.tag_name) + '</div>' +
+      '<span class="chip">' + esc(rl.tag_name) + '</span></div>' +
+      '<div class="chips">' + (rl.prerelease ? '<span class="chip warn">pre-release</span>' : '') +
+      (rl.draft ? '<span class="chip">draft</span>' : '') + '</div>' +
+      (rl.body ? '<div class="relbody">' + esc(rl.body) + '</div>' : '') +
+      '<div class="rcmeta">' + tAgo(rl.published_at) + (rl.author ? ' · by ' + esc(rl.author.login) : '') + '</div>';
+    // release assets — in-app downloads
+    if (rl.assets && rl.assets.length) {
+      html += '<div class="assetlist">';
+      rl.assets.forEach(a => {
+        html += '<div class="lrow" data-act="download" data-url="' + esc(a.browser_download_url) + '" data-name="' + esc(a.name) + '">' + SVG.dl +
+          '<div class="lmain"><div class="ltitle">' + esc(a.name) + '</div>' +
+          '<div class="lsub">' + fmtSize(a.size) + ' · ' + nf(a.download_count) + ' downloads</div></div>' +
+          (canWrite ? '<button class="iconbtn" data-act="delasset" data-full="' + esc(full) + '" data-aid="' + a.id + '" data-aname="' + esc(a.name) + '" aria-label="delete file">' + SVG.x + '</button>' : '') + '</div>';
+      });
+      html += '</div>';
+    }
+    // source code archives
+    html += '<div class="assetlist">' +
+      '<div class="lrow" data-act="download" data-url="https://github.com/' + full + '/archive/refs/tags/' + esc(rl.tag_name) + '.zip" data-name="' + esc(n + '-' + rl.tag_name + '.zip') + '">' + SVG.dl +
+      '<div class="lmain"><div class="ltitle">Source code (zip)</div><div class="lsub">complete snapshot of ' + esc(rl.tag_name) + '</div></div></div>' +
+      '<div class="lrow" data-act="download" data-url="https://github.com/' + full + '/archive/refs/tags/' + esc(rl.tag_name) + '.tar.gz" data-name="' + esc(n + '-' + rl.tag_name + '.tar.gz') + '">' + SVG.dl +
+      '<div class="lmain"><div class="ltitle">Source code (tar.gz)</div><div class="lsub">complete snapshot of ' + esc(rl.tag_name) + '</div></div></div>' +
+      '</div>' +
+      (canWrite ? '<div style="display:flex;gap:8px;margin-top:12px"><button class="btn sm ghost" data-act="relup" data-relup="' + rl.id + '" data-full="' + esc(full) + '" style="flex:1">Upload files</button>' +
+      '<button class="btn sm ghost" data-rel="' + rl.id + '" style="flex:1">Edit release</button></div></div>' : '</div>');
+  });
+  if (seq !== RSEQ) return;
+  view().innerHTML = html;
+  $$('[data-rel]').forEach(b => b.addEventListener('click', () => {
+    const rl = items.find(x => String(x.id) === b.dataset.rel);
+    if (rl) editReleaseSheet(o, n, rl);
+  }));
+  const nb = $('#newRelBtn');
+  if (nb) nb.addEventListener('click', () => newReleaseSheet(o, n));
+  $('#relUpInput').addEventListener('change', async e => {
+    const f = e.target.files && e.target.files[0];
+    const rid = window._relTarget;
+    e.target.value = '';
+    if (!f || !rid) return;
+    toast('Uploading ' + f.name + '…');
+    try { await uploadAsset(full, rid, f); toast('Uploaded ' + f.name); renderReleases(o, n); }
+    catch (er) { toast('Failed: ' + er.message); }
+  });
+}
+
+function cloneSheet(full) {
+  const https = 'https://github.com/' + full + '.git';
+  const ssh = 'git@github.com:' + full + '.git';
+  openSheet('<div class="sheethead"><b>Clone ' + esc(full) + '</b><button class="iconbtn" data-act="closesheet">' + SVG.x + '</button></div>' +
+    '<label class="fldlabel">HTTPS</label>' +
+    '<div class="clonebar"><input class="fld" readonly value="' + esc(https) + '"><button class="iconbtn" data-act="copy" data-copy="' + esc(https) + '">' + SVG.copy + '</button></div>' +
+    '<label class="fldlabel" style="margin-top:12px">SSH</label>' +
+    '<div class="clonebar"><input class="fld" readonly value="' + esc(ssh) + '"><button class="iconbtn" data-act="copy" data-copy="' + esc(ssh) + '">' + SVG.copy + '</button></div>' +
+    '<button class="btn primary btnblock" style="margin-top:16px" data-act="download" data-url="https://github.com/' + full + '/archive/HEAD.zip" data-name="' + esc(full.split('/')[1]) + '-main.zip">Download ZIP</button>');
+}
+
+async function renderRepoIssues(o, n) {
+  const seq = ++RSEQ;
+  if (seq !== RSEQ) return;
+  view().innerHTML = spinner();
+  let items;
+  try { items = await api('/repos/' + o + '/' + n + '/issues?state=all&sort=updated&per_page=50'); }
+  catch (e) { if (seq !== RSEQ) return; view().innerHTML = errCard(e); return; }
+  const newBtn = '<button class="btn ghost btnblock" id="newIssueBtn" style="margin-bottom:12px">New issue</button>';
+  if (!items.length) {
+    if (seq !== RSEQ) return;
+    view().innerHTML = newBtn + '<div class="card empty">No issues yet — nice and quiet.</div>';
+    $('#newIssueBtn').addEventListener('click', () => newIssueSheet(o, n));
+    return;
+  }
+  if (seq !== RSEQ) return;
+  view().innerHTML = newBtn + sortRowHTML('issues') + '<div class="card list">' + sortItems(items, 'issues').map(issueRow).join('') + '</div>';
+  $('#newIssueBtn').addEventListener('click', () => newIssueSheet(o, n));
+  wireSortRow('issues', () => renderRepoIssues(o, n));
+}
+
+/* ================= repo settings (full GitHub-style screen) ================= */
+function tgRow(title, sub, key, on) {
+  return '<div class="setrow" style="margin-top:14px"><div class="lmain"><div class="ltitle">' + title + '</div>' + (sub ? '<div class="lsub">' + sub + '</div>' : '') + '</div><button class="switch' + (on ? ' on' : '') + '" data-tg="' + key + '"></button></div>';
+}
+async function renderRepoSettings(o, n) {
+  const seq = ++RSEQ;
+  const full = o + '/' + n;
+  view().innerHTML = spinner();
+  const canWrite = await canPushRepo(o, n);
+  if (seq !== RSEQ) return;
+  if (!canWrite) { view().innerHTML = '<div class="card empty">You do not have permission to change this repository\u2019s settings.</div>'; return; }
+  let r;
+  try { r = await api('/repos/' + full); } catch (e) { if (seq === RSEQ) view().innerHTML = errCard(e); return; }
+  if (seq !== RSEQ) return;
+  const branches = await api('/repos/' + full + '/branches?per_page=100').catch(() => []);
+  if (seq !== RSEQ) return;
+  let html = '';
+  html += '<div class="card"><div class="ltitle" style="padding:2px 4px 12px;font-size:15px">General</div>' +
+    '<label class="fldlabel">Repository name</label><input class="fld" id="rsName" value="' + esc(r.name || '') + '" autocomplete="off" spellcheck="false">' +
+    '<label class="fldlabel" style="margin-top:12px">Description</label><input class="fld" id="rsDesc" value="' + esc(r.description || '') + '" autocomplete="off">' +
+    '<label class="fldlabel" style="margin-top:12px">Homepage</label><input class="fld" id="rsHome" value="' + esc(r.homepage || '') + '" placeholder="https://…" autocomplete="off">' +
+    '<label class="fldlabel" style="margin-top:12px">Default branch</label><select class="fld" id="rsBranch">' +
+    ((branches || []).map(b => '<option value="' + esc(b.name) + '"' + (b.name === r.default_branch ? ' selected' : '') + '>' + esc(b.name) + '</option>').join('') || '<option value="' + esc(r.default_branch || 'main') + '">' + esc(r.default_branch || 'main') + '</option>') +
+    '</select><button class="btn primary btnblock" id="rsSave" style="margin-top:16px">Save changes</button></div>';
+  html += '<div class="card"><div class="ltitle" style="padding:2px 4px 4px;font-size:15px">Features</div>' +
+    tgRow('Issues', 'Issue tracker for this repo', 'has_issues', r.has_issues) +
+    tgRow('Wiki', 'Editable wiki pages', 'has_wiki', r.has_wiki) +
+    tgRow('Projects', 'Repo projects and task boards', 'has_projects', r.has_projects) +
+    tgRow('Discussions', 'Community discussion forum', 'has_discussions', r.has_discussions) +
+    tgRow('Template repository', 'Others can generate new repos from it', 'is_template', r.is_template) +
+    tgRow('Private repository', 'Only you and collaborators can see it', 'private', r.private) + '</div>';
+  html += '<div class="card"><div class="ltitle" style="padding:2px 4px 4px;font-size:15px">Pull requests</div>' +
+    tgRow('Allow merge commits', 'Merge with a merge commit', 'allow_merge_commit', r.allow_merge_commit) +
+    tgRow('Allow squash merging', 'Squash all commits into one', 'allow_squash_merge', r.allow_squash_merge) +
+    tgRow('Allow rebase merging', 'Rebase and fast-forward', 'allow_rebase_merge', r.allow_rebase_merge) +
+    tgRow('Allow auto-merge', 'Merge automatically when checks pass', 'allow_auto_merge', r.allow_auto_merge) +
+    tgRow('Auto-delete head branches', 'Delete branches after merging', 'delete_branch_on_merge', r.delete_branch_on_merge) +
+    tgRow('Allow forking', 'Let others fork this private repo', 'allow_forking', r.allow_forking) + '</div>';
+  html += '<div class="card"><div class="rcrow"><div class="rcname">Collaborators</div><button class="btn sm ghost" id="rsAddCollab">Add</button></div><div id="rsCollabList">' + spinner(true) + '</div></div>';
+  html += '<div class="card"><div class="rcrow"><div class="rcname">Branches</div></div><div id="rsBranchList">' + spinner(true) + '</div></div>';
+  html += '<div class="card"><div class="rcrow"><div class="rcname">Tags</div></div><div id="rsTagList">' + spinner(true) + '</div></div>';
+  html += '<div class="card"><div class="rcrow"><div class="rcname">Webhooks</div><button class="btn sm ghost" id="rsAddHook">Add</button></div><div id="rsHookList">' + spinner(true) + '</div></div>';
+  html += '<div class="card"><div class="rcrow"><div class="rcname">Deploy keys</div><button class="btn sm ghost" id="rsAddKey">Add</button></div><div id="rsKeyList">' + spinner(true) + '</div></div>';
+  html += '<div class="card" id="pagesCard">' + spinner(true) + '</div>';
+  html += '<div class="card"><div class="rcrow"><div class="rcname">Environments</div><button class="btn sm ghost" id="rsAddEnv">New</button></div><div id="rsEnvList">' + spinner(true) + '</div></div>';
+  html += '<div class="card" id="ilCard">' + spinner(true) + '</div>';
+  html += '<div class="card"><div class="rcrow"><div class="rcname">Branch protection</div></div><div class="lsub" style="margin-top:4px">Require reviews, status checks or admin enforcement before merging into a branch.</div><label class="fldlabel" style="margin-top:12px">Branch</label><select class="fld" id="bpBranch"></select><button class="btn ghost btnblock" id="bpEdit" style="margin-top:14px">Protection rules</button></div>';
+  html += '<div class="card"><div class="ltitle" style="padding:2px 4px 4px;font-size:15px">Danger zone</div>' +
+    tgRow('Archived', 'Makes the repository read-only for everyone', 'archived', r.archived) +
+    '<div style="display:flex;gap:8px;margin-top:16px"><button class="btn danger" id="rsVisibility" style="flex:1">Change visibility</button><button class="btn danger" id="rsTransfer" style="flex:1">Transfer</button></div>' +
+    '<button class="btn danger btnblock" id="rsDelete" style="margin-top:8px">Delete repository</button></div>';
+  view().innerHTML = html;
+  $('#rsSave').addEventListener('click', async () => {
+    const newName = $('#rsName').value.trim();
+    if (!newName) { toast('Repository name cannot be empty'); return; }
+    if (!/^[A-Za-z0-9._-]+$/.test(newName)) { toast('Name can only use letters, numbers, . _ and -'); return; }
+    if (newName.length > 100) { toast('Name is too long (max 100 characters)'); return; }
+    const btn = $('#rsSave'); btn.disabled = true;
+    try {
+      const upd = await api('/repos/' + full, { method: 'PATCH', body: JSON.stringify({ name: newName, description: $('#rsDesc').value.trim(), homepage: $('#rsHome').value.trim() }) });
+      const finalName = (upd && upd.name) ? upd.name : newName;
+      if (finalName !== n) { toast('Renamed to ' + finalName); location.hash = '#/repo/' + o + '/' + finalName + '/settings'; }
+      else { toast('Saved'); btn.disabled = false; }
+    } catch (e) { toast('Failed: ' + e.message); btn.disabled = false; }
+  });
+  $('#rsBranch').addEventListener('change', async e => {
+    try { await api('/repos/' + full, { method: 'PATCH', body: JSON.stringify({ default_branch: e.target.value }) }); r.default_branch = e.target.value; toast('Default branch set to ' + e.target.value); loadBranches(); }
+    catch (er) { toast('Failed: ' + er.message); }
+  });
+  view().querySelectorAll('[data-tg]').forEach(sw => sw.addEventListener('click', async () => {
+    const key = sw.dataset.tg;
+    const val = !sw.classList.contains('on');
+    try {
+      if (key === 'archived') await api('/repos/' + full + (val ? '/archive' : '/unarchive'), { method: 'PUT' });
+      else await api('/repos/' + full, { method: 'PATCH', body: JSON.stringify({ [key]: val }) });
+      sw.classList.toggle('on', val);
+      toast('Saved');
+    } catch (e) { toast('Failed: ' + e.message); }
+  }));
+  $('#rsDelete').addEventListener('click', () => deleteRepoSheet(o, n));
+  const rsVis = $('#rsVisibility');
+  if (rsVis) rsVis.addEventListener('click', () => {
+    const makePrivate = !r.private;
+    if (!window.confirm(makePrivate ? 'Make this repository private? Only you and collaborators will see it.' : 'Make this repository public? Anyone on the internet can see it.')) return;
+    api('/repos/' + full, { method: 'PATCH', body: JSON.stringify({ private: makePrivate }) }).then(() => { toast('Repository is now ' + (makePrivate ? 'private' : 'public')); r.private = makePrivate; })
+      .catch(e => toast('Failed: ' + e.message));
+  });
+  const rsTr = $('#rsTransfer');
+  if (rsTr) rsTr.addEventListener('click', () => transferSheet(o, n));
+  loadPages(o, n);
+  loadEnvs(o, n);
+  loadIL(o, n);
+  const bpSel = $('#bpBranch');
+  if (bpSel) {
+    bpSel.innerHTML = (branches || []).map(b => '<option value="' + esc(b.name) + '"' + (b.name === r.default_branch ? ' selected' : '') + '>' + esc(b.name) + '</option>').join('');
+    const bpe = $('#bpEdit');
+    if (bpe) bpe.addEventListener('click', () => { if (bpSel.value) protectionSheet(o, n, bpSel.value); });
+  }
+  const aenv = $('#rsAddEnv');
+  if (aenv) aenv.addEventListener('click', async () => {
+    const name = window.prompt('Environment name (e.g. production, github-pages)');
+    if (!name) return;
+    try { await api('/repos/' + full + '/environments/' + encodeURIComponent(name.trim()), { method: 'PUT', body: JSON.stringify({}) }); toast('Environment created'); loadEnvs(o, n); }
+    catch (e) { toast('Failed: ' + e.message); }
+  });
+  const loadCollab = async () => {
+    const el = $('#rsCollabList'); if (!el) return;
+    try {
+      const cols = await api('/repos/' + full + '/collaborators?affiliation=direct');
+      el.innerHTML = cols.length ? cols.map(c => '<div class="lrow" style="padding:10px 0">' +
+        '<img class="cav" src="' + esc(c.avatar_url) + '" alt=""><div class="lmain"><div class="ltitle">' + esc(c.login) + '</div><div class="lsub">' +
+        (c.permissions && c.permissions.admin ? 'admin' : (c.permissions && c.permissions.push ? 'write' : 'read')) + (USER && c.login === USER.login ? ' · you' : '') + '</div></div>' +
+        (USER && c.login !== USER.login ? '<button class="iconbtn" data-rmcol="' + esc(c.login) + '" aria-label="remove">' + SVG.x + '</button>' : '') + '</div>').join('') :
+        '<div class="lsub" style="padding:10px 0">No collaborators yet — add one above.</div>';
+      el.querySelectorAll('[data-rmcol]').forEach(b => b.addEventListener('click', async () => {
+        if (!window.confirm('Remove ' + b.dataset.rmcol + ' from this repository?')) return;
+        try { await api('/repos/' + full + '/collaborators/' + b.dataset.rmcol, { method: 'DELETE' }); toast('Removed ' + b.dataset.rmcol); loadCollab(); }
+        catch (e) { toast('Failed: ' + e.message); }
+      }));
+    } catch (e) { el.innerHTML = '<div class="lsub" style="padding:10px 0">' + esc(e.message) + '</div>'; }
+  };
+  const loadBranches = async () => {
+    const el = $('#rsBranchList'); if (!el) return;
+    try {
+      const bs = await api('/repos/' + full + '/branches?per_page=100');
+      el.innerHTML = bs.length ? bs.map(b => '<div class="lrow" style="padding:10px 0">' + SVG.folder +
+        '<div class="lmain"><div class="ltitle">' + esc(b.name) + (b.name === r.default_branch ? ' <span class="chip">default</span>' : '') + '</div></div>' +
+        (b.name !== r.default_branch ? '<button class="btn sm ghost" data-setdef="' + esc(b.name) + '" style="margin-right:6px">Make default</button><button class="iconbtn" data-rmbr="' + esc(b.name) + '" aria-label="delete">' + SVG.x + '</button>' : '') + '</div>').join('') :
+        '<div class="lsub" style="padding:10px 0">No branches.</div>';
+      el.querySelectorAll('[data-setdef]').forEach(b => b.addEventListener('click', async () => {
+        try { await api('/repos/' + full, { method: 'PATCH', body: JSON.stringify({ default_branch: b.dataset.setdef }) }); r.default_branch = b.dataset.setdef; $('#rsBranch').value = b.dataset.setdef; toast('Default branch set to ' + b.dataset.setdef); loadBranches(); }
+        catch (e) { toast('Failed: ' + e.message); }
+      }));
+      el.querySelectorAll('[data-rmbr]').forEach(b => b.addEventListener('click', async () => {
+        if (!window.confirm('Delete branch ' + b.dataset.rmbr + '?')) return;
+        try { await api('/repos/' + full + '/git/refs/heads/' + b.dataset.rmbr, { method: 'DELETE' }); toast('Branch deleted'); loadBranches(); }
+        catch (e) { toast('Failed: ' + e.message); }
+      }));
+    } catch (e) { el.innerHTML = '<div class="lsub" style="padding:10px 0">' + esc(e.message) + '</div>'; }
+  };
+  const loadTags = async () => {
+    const el = $('#rsTagList'); if (!el) return;
+    try {
+      const ts = await api('/repos/' + full + '/tags?per_page=100');
+      el.innerHTML = ts.length ? ts.map(t => '<div class="lrow" style="padding:10px 0"><div class="lmain"><div class="ltitle">' + esc(t.name) + '</div><div class="lsub">' + esc((t.commit && t.commit.sha || '').slice(0, 7)) + '</div></div>' +
+        '<button class="iconbtn" data-rmtag="' + esc(t.name) + '" aria-label="delete">' + SVG.x + '</button></div>').join('') :
+        '<div class="lsub" style="padding:10px 0">No tags yet.</div>';
+      el.querySelectorAll('[data-rmtag]').forEach(b => b.addEventListener('click', async () => {
+        if (!window.confirm('Delete tag ' + b.dataset.rmtag + '? This can break releases that point to it.')) return;
+        try { await api('/repos/' + full + '/git/refs/tags/' + b.dataset.rmtag, { method: 'DELETE' }); toast('Tag deleted'); loadTags(); }
+        catch (e) { toast('Failed: ' + e.message); }
+      }));
+    } catch (e) { el.innerHTML = '<div class="lsub" style="padding:10px 0">' + esc(e.message) + '</div>'; }
+  };
+  const loadHooks = async () => {
+    const el = $('#rsHookList'); if (!el) return;
+    try {
+      const hs = await api('/repos/' + full + '/hooks');
+      el.innerHTML = hs.length ? hs.map(h => '<div class="lrow" style="padding:10px 0"><div class="lmain"><div class="ltitle" style="word-break:break-all">' + esc((h.config && h.config.url) || 'webhook') + '</div><div class="lsub">' +
+        ((h.events || []).join(', ') || 'no events') + (h.active === false ? ' · paused' : '') + '</div></div>' +
+        '<button class="iconbtn" data-rmhook="' + h.id + '" aria-label="delete">' + SVG.x + '</button></div>').join('') :
+        '<div class="lsub" style="padding:10px 0">No webhooks configured.</div>';
+      el.querySelectorAll('[data-rmhook]').forEach(b => b.addEventListener('click', async () => {
+        if (!window.confirm('Delete this webhook?')) return;
+        try { await api('/repos/' + full + '/hooks/' + b.dataset.rmhook, { method: 'DELETE' }); toast('Webhook deleted'); loadHooks(); }
+        catch (e) { toast('Failed: ' + e.message); }
+      }));
+    } catch (e) { el.innerHTML = '<div class="lsub" style="padding:10px 0">' + esc(e.message) + '</div>'; }
+  };
+  const loadKeys = async () => {
+    const el = $('#rsKeyList'); if (!el) return;
+    try {
+      const ks = await api('/repos/' + full + '/keys');
+      el.innerHTML = ks.length ? ks.map(k => '<div class="lrow" style="padding:10px 0"><div class="lmain"><div class="ltitle">' + esc(k.title) + (k.read_only ? ' <span class="chip">read-only</span>' : '') + '</div><div class="lsub">' + esc((k.fingerprint || '').replace(/^SHA256:/, '')) + '</div></div>' +
+        '<button class="iconbtn" data-rmkey="' + k.id + '" aria-label="delete">' + SVG.x + '</button></div>').join('') :
+        '<div class="lsub" style="padding:10px 0">No deploy keys.</div>';
+      el.querySelectorAll('[data-rmkey]').forEach(b => b.addEventListener('click', async () => {
+        if (!window.confirm('Delete this deploy key?')) return;
+        try { await api('/repos/' + full + '/keys/' + b.dataset.rmkey, { method: 'DELETE' }); toast('Key deleted'); loadKeys(); }
+        catch (e) { toast('Failed: ' + e.message); }
+      }));
+    } catch (e) { el.innerHTML = '<div class="lsub" style="padding:10px 0">' + esc(e.message) + '</div>'; }
+  };
+  $('#rsAddCollab').addEventListener('click', () => addCollabSheet(full, loadCollab));
+  $('#rsAddHook').addEventListener('click', () => addWebhookSheet(full, loadHooks));
+  $('#rsAddKey').addEventListener('click', () => addDeployKeySheet(full, loadKeys));
+  loadCollab(); loadBranches(); loadTags(); loadHooks(); loadKeys();
+}
+function addCollabSheet(full, after) {
+  openSheet('<div class="sheethead"><b>Add collaborator</b><button class="iconbtn" data-act="closesheet">' + SVG.x + '</button></div>' +
+    '<label class="fldlabel">GitHub username</label><input class="fld" id="acUser" placeholder="username" autocomplete="off">' +
+    '<button class="btn primary btnblock" id="acGo" style="margin-top:16px">Add</button>');
+  $('#acGo').addEventListener('click', async () => {
+    const u = $('#acUser').value.trim();
+    if (!u) { toast('Enter a username'); return; }
+    try {
+      await api('/repos/' + full + '/collaborators/' + u, { method: 'PUT', body: JSON.stringify({ permission: 'write' }) });
+      closeSheet(); toast('Added ' + u + ' as a collaborator'); after && after();
+    } catch (e) { toast('Failed: ' + e.message); }
+  });
+}
+function addWebhookSheet(full, after) {
+  openSheet('<div class="sheethead"><b>Add webhook</b><button class="iconbtn" data-act="closesheet">' + SVG.x + '</button></div>' +
+    '<label class="fldlabel">Payload URL</label><input class="fld" id="whUrl" placeholder="https://example.com/hook" autocomplete="off">' +
+    '<div class="seg sm" style="margin-top:14px"><button class="segb on" id="whEvPush">Push events</button><button class="segb" id="whEvAll">Everything</button></div>' +
+    '<div class="lsub" style="margin-top:10px">GitHub will POST repo activity to this URL.</div>' +
+    '<button class="btn primary btnblock" id="whGo" style="margin-top:16px">Add webhook</button>');
+  let all = false;
+  $('#whEvPush').addEventListener('click', () => { all = false; $('#whEvPush').classList.add('on'); $('#whEvAll').classList.remove('on'); });
+  $('#whEvAll').addEventListener('click', () => { all = true; $('#whEvAll').classList.add('on'); $('#whEvPush').classList.remove('on'); });
+  $('#whGo').addEventListener('click', async () => {
+    const url = $('#whUrl').value.trim();
+    if (!/^https?:\/\//.test(url)) { toast('Enter a valid https:// URL'); return; }
+    try {
+      await api('/repos/' + full + '/hooks', { method: 'POST', body: JSON.stringify({ name: 'web', active: true, events: all ? ['*'] : ['push'], config: { url: url, content_type: 'json' } }) });
+      closeSheet(); toast('Webhook added'); after && after();
+    } catch (e) { toast('Failed: ' + e.message); }
+  });
+}
+function addDeployKeySheet(full, after) {
+  openSheet('<div class="sheethead"><b>Add deploy key</b><button class="iconbtn" data-act="closesheet">' + SVG.x + '</button></div>' +
+    '<label class="fldlabel">Title</label><input class="fld" id="dkTitle" autocomplete="off">' +
+    '<label class="fldlabel" style="margin-top:12px">Key</label><textarea class="replyta" id="dkKey" placeholder="ssh-ed25519 AAAA…" spellcheck="false"></textarea>' +
+    '<div class="setrow" style="margin-top:14px"><div class="lmain"><div class="ltitle">Read-only access</div><div class="lsub">This key can pull but not push</div></div><button class="switch on" id="dkRo"></button></div>' +
+    '<button class="btn primary btnblock" id="dkGo" style="margin-top:16px">Add key</button>');
+  $('#dkRo').addEventListener('click', () => $('#dkRo').classList.toggle('on'));
+  $('#dkGo').addEventListener('click', async () => {
+    const title = $('#dkTitle').value.trim(), key = $('#dkKey').value.trim();
+    if (!title || !key) { toast('Title and key are both required'); return; }
+    try {
+      await api('/repos/' + full + '/keys', { method: 'POST', body: JSON.stringify({ title: title, key: key, read_only: $('#dkRo').classList.contains('on') }) });
+      closeSheet(); toast('Deploy key added'); after && after();
+    } catch (e) { toast('Failed: ' + e.message); }
+  });
+}
+
+function repoPickerSheet(cb) {
+  openSheet('<div class="sheethead"><b>Pick a repository</b><button class="iconbtn" data-act="closesheet">' + SVG.x + '</button></div>' +
+    '<div id="rpList" style="max-height:60vh;overflow:auto">' + spinner() + '</div>');
+  api('/user/repos?per_page=100&sort=pushed').then(repos => {
+    const el = $('#rpList');
+    if (!el) return;
+    if (!repos.length) { el.innerHTML = '<div class="card empty">No repositories found.</div>'; return; }
+    el.innerHTML = '<div class="card list">' + repos.map(r =>
+      '<div class="lrow" data-pick="' + esc(r.full_name) + '">' + SVG.folder + '<div class="lmain"><div class="ltitle">' + esc(r.name) + '</div><div class="lsub">' + esc(r.full_name) + (r.description ? ' · ' + esc(r.description.slice(0, 60)) : '') + '</div></div></div>').join('') + '</div>';
+    $$('[data-pick]').forEach(row => row.addEventListener('click', () => {
+      const parts = row.dataset.pick.split('/');
+      cb(parts[0], parts[1]);
+    }));
+  }).catch(e => { const el = $('#rpList'); if (el) el.innerHTML = errCard(e); });
+}
+
+function newIssueSheet(o, n) {
+  openSheet('<div class="sheethead"><b>New issue — ' + esc(n) + '</b><button class="iconbtn" data-act="closesheet">' + SVG.x + '</button></div>' +
+    '<input class="fld" id="niTitle" placeholder="Issue title" style="margin-bottom:10px">' +
+    '<textarea id="niBody" class="replyta" placeholder="Describe the issue…"></textarea>' +
+    '<button class="btn primary btnblock" id="niSubmit" style="margin-top:12px">Submit issue</button>');
+  $('#niSubmit').addEventListener('click', async () => {
+    const title = $('#niTitle').value.trim(), body = $('#niBody').value;
+    if (!title) { toast('Add a title first'); return; }
+    $('#niSubmit').disabled = true;
+    try {
+      const iss = await api('/repos/' + o + '/' + n + '/issues', { method: 'POST', body: JSON.stringify({ title, body }) });
+      closeSheet(); toast('Issue #' + iss.number + ' created');
+      location.hash = '#/issue/' + o + '/' + n + '/' + iss.number;
+    } catch (e) { toast('Failed: ' + e.message); $('#niSubmit').disabled = false; }
+  });
+}
+
+/* ================= create sheets (repo / gist / file / profile) ================= */
+function newRepoSheet() {
+  openSheet('<div class="sheethead"><b>New repository</b><button class="iconbtn" data-act="closesheet">' + SVG.x + '</button></div>' +
+    '<label class="fldlabel">Repository name</label>' +
+    '<input class="fld" id="nrName" placeholder="my-awesome-project" autocomplete="off">' +
+    '<label class="fldlabel" style="margin-top:12px">Description (optional)</label>' +
+    '<input class="fld" id="nrDesc" placeholder="A short description" autocomplete="off">' +
+    '<div class="seg" style="margin:16px 0 0"><button class="segb on" data-vis="private">Private</button><button class="segb" data-vis="public">Public</button></div>' +
+    '<div class="setrow" style="margin-top:16px"><div class="lmain"><div class="ltitle">Initialize with README</div><div class="lsub">Adds a starter README.md</div></div><button class="switch" id="nrReadme"></button></div>' +
+    '<button class="btn primary btnblock" id="nrSubmit" style="margin-top:18px">Create repository</button>');
+  let vis = 'private';
+  $$('[data-vis]').forEach(b => b.addEventListener('click', () => { vis = b.dataset.vis; $$('[data-vis]').forEach(x => x.classList.toggle('on', x === b)); }));
+  const rmSw = $('#nrReadme');
+  rmSw.addEventListener('click', () => rmSw.classList.toggle('on'));
+  $('#nrSubmit').addEventListener('click', async () => {
+    const name = $('#nrName').value.trim();
+    if (!name) { toast('Give your repo a name'); return; }
+    $('#nrSubmit').disabled = true;
+    try {
+      const r = await api('/user/repos', { method: 'POST', body: JSON.stringify({ name, description: $('#nrDesc').value.trim(), private: vis === 'private', auto_init: rmSw.classList.contains('on') }) });
+      closeSheet(); toast('Created ' + r.full_name);
+      location.hash = '#/repo/' + r.full_name;
+    } catch (e) { toast('Failed: ' + e.message); $('#nrSubmit').disabled = false; }
+  });
+}
+
+function newGistSheet() {
+  openSheet('<div class="sheethead"><b>New gist</b><button class="iconbtn" data-act="closesheet">' + SVG.x + '</button></div>' +
+    '<label class="fldlabel">Description (optional)</label>' +
+    '<input class="fld" id="ngDesc" placeholder="What is this snippet?">' +
+    '<label class="fldlabel" style="margin-top:12px">Filename</label>' +
+    '<input class="fld" id="ngFile" value="snippet.txt" autocomplete="off">' +
+    '<label class="fldlabel" style="margin-top:12px">Content</label>' +
+    '<textarea class="replyta" id="ngBody" placeholder="Paste or write your code here…"></textarea>' +
+    '<div class="seg" style="margin:16px 0 0"><button class="segb on" data-gvis="secret">Secret</button><button class="segb" data-gvis="public">Public</button></div>' +
+    '<button class="btn primary btnblock" id="ngSubmit" style="margin-top:18px">Create gist</button>');
+  let gvis = 'secret';
+  $$('[data-gvis]').forEach(b => b.addEventListener('click', () => { gvis = b.dataset.gvis; $$('[data-gvis]').forEach(x => x.classList.toggle('on', x === b)); }));
+  $('#ngSubmit').addEventListener('click', async () => {
+    const fname = $('#ngFile').value.trim() || 'snippet.txt';
+    const content = $('#ngBody').value;
+    if (!content.trim()) { toast('Write something first'); return; }
+    $('#ngSubmit').disabled = true;
+    try {
+      const files = {}; files[fname] = { content };
+      const g = await api('/gists', { method: 'POST', body: JSON.stringify({ description: $('#ngDesc').value.trim(), public: gvis === 'public', files }) });
+      closeSheet(); toast('Gist created');
+      location.hash = '#/gist/' + g.id;
+    } catch (e) { toast('Failed: ' + e.message); $('#ngSubmit').disabled = false; }
+  });
+}
+
+function addFileSheet(o, n, path, prefill) {
+  openSheet('<div class="sheethead"><b>Add file — ' + esc(n + '/' + (path || '')) + '</b><button class="iconbtn" data-act="closesheet">' + SVG.x + '</button></div>' +
+    '<label class="fldlabel">Filename</label>' +
+    '<input class="fld" id="afName" placeholder="hello.js" autocomplete="off">' +
+    '<label class="fldlabel" style="margin-top:12px">Content</label>' +
+    '<textarea class="replyta" id="afBody" placeholder="File contents…"></textarea>' +
+    '<label class="fldlabel" style="margin-top:12px">Commit message</label>' +
+    '<input class="fld" id="afMsg" placeholder="Create file" autocomplete="off">' +
+    '<button class="btn primary btnblock" id="afSubmit" style="margin-top:18px">Commit file</button>');
+  if (prefill) $('#afName').value = prefill;
+  $('#afSubmit').addEventListener('click', async () => {
+    const fname = $('#afName').value.trim();
+    if (!fname) { toast('Give the file a name'); return; }
+    const content = $('#afBody').value;
+    if (!content) { toast('File is empty'); return; }
+    $('#afSubmit').disabled = true;
+    try {
+      const b64 = btoa(unescape(encodeURIComponent(content)));
+      const p = path ? path + '/' + fname : fname;
+      const body = { message: $('#afMsg').value.trim() || ('Create ' + fname), content: b64 };
+      const meta = await api('/repos/' + o + '/' + n + '/contents/' + p, { status: true }).catch(() => null);
+      if (meta && meta.ok && meta.data && meta.data.sha) body.sha = meta.data.sha;
+      await api('/repos/' + o + '/' + n + '/contents/' + p, { method: 'PUT', body: JSON.stringify(body) });
+      closeSheet(); toast('Committed ' + fname);
+      renderFiles(o, n, path);
+    } catch (e) { toast('Failed: ' + e.message); $('#afSubmit').disabled = false; }
+  });
+}
+
+function editProfileSheet() {
+  const u = USER || {};
+  openSheet('<div class="sheethead"><b>Edit profile</b><button class="iconbtn" data-act="closesheet">' + SVG.x + '</button></div>' +
+    '<label class="fldlabel">Name</label>' +
+    '<input class="fld" id="epName" value="' + esc(u.name || '') + '">' +
+    '<label class="fldlabel" style="margin-top:12px">Bio</label>' +
+    '<textarea class="replyta" id="epBio" style="min-height:90px">' + esc(u.bio || '') + '</textarea>' +
+    '<label class="fldlabel" style="margin-top:12px">Location</label>' +
+    '<input class="fld" id="epLoc" value="' + esc(u.location || '') + '">' +
+    '<button class="btn primary btnblock" id="epSubmit" style="margin-top:18px">Save profile</button>');
+  $('#epSubmit').addEventListener('click', async () => {
+    $('#epSubmit').disabled = true;
+    try {
+      USER = await api('/user', { method: 'PATCH', body: JSON.stringify({ name: $('#epName').value.trim(), bio: $('#epBio').value.trim(), location: $('#epLoc').value.trim() }) });
+      closeSheet(); toast('Profile updated');
+      if (location.hash === '#/user/' + USER.login || location.hash === '#/user/' + u.login) renderUser(USER.login); else route();
+    } catch (e) { toast('Failed: ' + e.message); $('#epSubmit').disabled = false; }
+  });
+}
+
+/* ================= repo editing: upload / edit file / release / repo meta ================= */
+function fileToB64(file) {
+  return new Promise((res, rej) => {
+    const r = new FileReader();
+    r.onload = () => res(String(r.result).split(',')[1]);
+    r.onerror = () => rej(new Error('Could not read file'));
+    r.readAsDataURL(file);
+  });
+}
+let uplSeq = 0; const uplWait = {};
+window.__uplDone = (jid, ok, msg) => { const w = uplWait[jid]; if (w) { delete uplWait[jid]; ok ? w.res(true) : w.rej(new Error(msg || 'upload failed')); } };
+async function uploadAsset(full, id, file) {
+  const viaBridge = () => {
+    const jid = ++uplSeq;
+    return fileToB64(file).then(b64 => new Promise((res, rej) => {
+      uplWait[jid] = { res, rej };
+      try { window.OneGit.uploadAsset(jid, full, String(id), file.name, file.type || 'application/octet-stream', b64); }
+      catch (e) { delete uplWait[jid]; rej(e); }
+    }));
+  };
+  if (window.OneGit && window.OneGit.uploadAsset) {
+    try { return await viaBridge(); } catch (e) { /* fall through to the fetch path */ }
+  }
+  const buf = await file.arrayBuffer();
+  const res = await fetch('https://uploads.github.com/repos/' + full + '/releases/' + id + '/assets?name=' + encodeURIComponent(file.name), {
+    method: 'POST',
+    headers: { 'Authorization': 'Bearer ' + TOKEN, 'Accept': 'application/vnd.github+json', 'Content-Type': file.type || 'application/octet-stream' },
+    body: buf
+  });
+  if (!res.ok) { let d = null; try { d = await res.json(); } catch (e) {} throw new Error((d && d.message) || ('HTTP ' + res.status)); }
+  return res.json();
+}
+
+function editFileSheet(full, path, raw, sha) {
+  const name = path.split('/').pop();
+  openSheet('<div class="sheethead"><b>Edit — ' + esc(name) + '</b><button class="iconbtn" data-act="closesheet">' + SVG.x + '</button></div>' +
+    '<textarea class="replyta" id="efBody" style="min-height:40vh;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px"></textarea>' +
+    '<label class="fldlabel" style="margin-top:12px">Commit message</label>' +
+    '<input class="fld" id="efMsg" value="Update ' + esc(name) + '" autocomplete="off">' +
+    '<button class="btn primary btnblock" id="efSave" style="margin-top:16px">Commit changes</button>');
+  $('#efBody').value = raw;
+  $('#efSave').addEventListener('click', async () => {
+    const content = $('#efBody').value;
+    if (content === raw) { toast('No changes to commit'); return; }
+    $('#efSave').disabled = true;
+    try {
+      const b64 = btoa(unescape(encodeURIComponent(content)));
+      await api('/repos/' + full + '/contents/' + path, { method: 'PUT', body: JSON.stringify({ message: $('#efMsg').value.trim() || ('Update ' + name), content: b64, sha }) });
+      closeSheet(); toast('Committed changes');
+      const parts = full.split('/'), dir = path.split('/').slice(0, -1).join('/');
+      renderFiles(parts[0], parts[1], dir);
+    } catch (e) { toast('Failed: ' + e.message); $('#efSave').disabled = false; }
+  });
+}
+
+function confirmDeleteFile(full, path) {
+  const name = path.split('/').pop();
+  openSheet('<div class="sheethead"><b>Delete — ' + esc(name) + '</b><button class="iconbtn" data-act="closesheet">' + SVG.x + '</button></div>' + spinner(true));
+  api('/repos/' + full + '/contents/' + encodeURIComponent(path).replace(/%2F/g, '/')).then(meta => {
+    if (meta && meta.sha) deleteFileSheet(full, path, meta.sha);
+    else { closeSheet(); toast('Cannot delete this file'); }
+  }).catch(e => { closeSheet(); toast('Failed: ' + e.message); });
+}
+
+function editReleaseSheet(o, n, rl) {
+  const full = o + '/' + n;
+  const curTag = (rl.tag_name && rl.tag_name.indexOf('untagged-') === 0) ? '' : (rl.tag_name || '');
+  openSheet('<div class="sheethead"><b>Edit release — ' + esc(rl.name || rl.tag_name) + '</b><button class="iconbtn" data-act="closesheet">' + SVG.x + '</button></div>' +
+    '<label class="fldlabel">Tag</label>' +
+    '<input class="fld" id="xrlTag" value="' + esc(curTag) + '" placeholder="v1.0.0" autocomplete="off">' +
+    '<label class="fldlabel" style="margin-top:12px">Release title</label>' +
+    '<input class="fld" id="xrlTitle" value="' + esc(rl.name || rl.tag_name) + '" autocomplete="off">' +
+    '<label class="fldlabel" style="margin-top:12px">Release notes</label>' +
+    '<textarea class="replyta" id="xrlBody">' + esc(rl.body || '') + '</textarea>' +
+    '<button class="btn primary btnblock" id="xrlSave" style="margin-top:16px">Save release</button>' +
+    (rl.draft ? '<label class="fldlabel" style="margin-top:20px">Publish draft</label>' +
+      '<div class="lsub" style="margin-bottom:8px">This release is a draft — only you can see it. Publishing makes it public for everyone, using the tag above.</div>' +
+      '<button class="btn primary btnblock" id="xrlPublish" style="margin-top:10px">Publish release</button>' : '') +
+    '<label class="fldlabel" style="margin-top:20px">Attach files</label>' +
+    '<div class="lsub" style="margin-bottom:8px">Uploads go straight into this release</div>' +
+    '<button class="btn ghost btnblock" id="xrlFiles">Upload files to this release</button>' +
+    '<div id="xrlAssets"></div>' +
+    '<input type="file" id="xrlInput" multiple hidden>');
+  const drawXAssets = () => {
+    const el = $('#xrlAssets');
+    if (!el) return;
+    const as = rl.assets || [];
+    el.innerHTML = as.length ? '<div class="lsub" style="margin-top:12px">Files in this release</div>' + as.map(a =>
+      '<div style="display:flex;align-items:center;gap:10px;padding:8px 0">' +
+      '<div class="lmain" style="flex:1;min-width:0"><div class="ltitle">' + esc(a.name) + '</div>' +
+      '<div class="lsub">' + fmtSize(a.size) + ' · ' + nf(a.download_count) + ' downloads</div></div>' +
+      '<button class="iconbtn" data-act="renasset" data-full="' + esc(full) + '" data-aid="' + a.id + '" data-aname="' + esc(a.name) + '" aria-label="rename">' + SVG.pen + '</button>' +
+      '<button class="iconbtn" data-act="delasset" data-full="' + esc(full) + '" data-aid="' + a.id + '" data-aname="' + esc(a.name) + '" aria-label="delete">' + SVG.x + '</button></div>').join('') : '';
+  };
+  drawXAssets();
+  $('#xrlSave').addEventListener('click', async () => {
+    const tag = ($('#xrlTag').value || '').trim();
+    if (/[^A-Za-z0-9._\-+]/.test(tag)) { toast('Tags cannot contain spaces — use letters, numbers, dots, dashes (e.g. First-Stable)'); return; }
+    const patch = { name: $('#xrlTitle').value.trim() || rl.tag_name, body: $('#xrlBody').value };
+    if (tag && tag !== curTag) patch.tag_name = tag;
+    $('#xrlSave').disabled = true;
+    try {
+      await api('/repos/' + full + '/releases/' + rl.id, { method: 'PATCH', body: JSON.stringify(patch) });
+      closeSheet(); toast('Release updated'); renderReleases(o, n);
+    } catch (e) { toast('Failed: ' + e.message); $('#xrlSave').disabled = false; }
+  });
+  const pb = $('#xrlPublish');
+  if (pb) pb.addEventListener('click', async () => {
+    const tag = ($('#xrlTag').value || '').trim();
+    if (!tag) { toast('Enter a tag like v1.0.0'); return; }
+    if (/[^A-Za-z0-9._\-+]/.test(tag)) { toast('Tags cannot contain spaces — use letters, numbers, dots, dashes (e.g. First-Stable)'); return; }
+    pb.disabled = true;
+    try {
+      await api('/repos/' + full + '/releases/' + rl.id, { method: 'PATCH', body: JSON.stringify({ tag_name: tag, draft: false, prerelease: !!rl.prerelease }) });
+      closeSheet(); toast('Release published'); renderReleases(o, n);
+    } catch (e) { toast('Failed: ' + e.message); pb.disabled = false; }
+  });
+  $('#xrlFiles').addEventListener('click', () => {
+    if (window.OneGit && window.OneGit.pickAssets) {
+      try {
+        window._assetAfter = async () => {
+          try {
+            const rels = await api('/repos/' + full + '/releases');
+            const fresh = (rels || []).find(x => x.id === rl.id);
+            if (fresh) { rl.assets = fresh.assets || []; drawXAssets(); }
+          } catch (er) {}
+          renderReleases(o, n);
+        };
+        toast('Choose files to attach');
+        window.OneGit.pickAssets(full, String(rl.id));
+        return;
+      } catch (e) {}
+    }
+    $('#xrlInput').click();
+  });
+  $('#xrlInput').addEventListener('change', async e => {
+    const files = Array.from(e.target.files || []);
+    e.target.value = '';
+    if (!files.length) return;
+    toast('Uploading ' + files.length + ' file' + (files.length > 1 ? 's' : '') + '…');
+    let done = 0;
+    for (const f of files) {
+      try { await uploadAsset(full, rl.id, f); done++; }
+      catch (er) { toast('Failed: ' + f.name + ' — ' + er.message); }
+    }
+    toast(done ? 'Uploaded ' + done + ' file' + (done > 1 ? 's' : '') : 'No files uploaded');
+    try {
+      const rels = await api('/repos/' + full + '/releases');
+      const fresh = (rels || []).find(x => x.id === rl.id);
+      if (fresh) rl.assets = fresh.assets || [];
+    } catch (er) {}
+    drawXAssets();
+    renderReleases(o, n);
+  });
+}
+
+function renameAssetSheet(full, aid, name) {
+  openSheet('<div class="sheethead"><b>Rename file</b><button class="iconbtn" data-act="closesheet">' + SVG.x + '</button></div>' +
+    '<label class="fldlabel">File name</label>' +
+    '<input class="fld" id="raName" value="' + esc(name) + '" autocomplete="off" spellcheck="false">' +
+    '<button class="btn primary btnblock" id="raSave" style="margin-top:16px">Rename</button>');
+  $('#raName').addEventListener('keydown', e => { if (e.key === 'Enter') $('#raSave').click(); });
+  $('#raSave').addEventListener('click', async () => {
+    const nn = $('#raName').value.trim();
+    if (!nn) { toast('Enter a file name'); return; }
+    if (nn === name) { closeSheet(); return; }
+    $('#raSave').disabled = true;
+    try {
+      await api('/repos/' + full + '/releases/assets/' + aid, { method: 'PATCH', body: JSON.stringify({ name: nn }) });
+      closeSheet(); toast('Renamed to ' + nn);
+      const parts = full.split('/');
+      renderReleases(parts[0], parts[1]);
+    } catch (e) { toast('Failed: ' + e.message); $('#raSave').disabled = false; }
+  });
+}
+
+function deleteAssetSheet(full, aid, name) {
+  openSheet('<div class="sheethead"><b>Delete file — ' + esc(name) + '</b><button class="iconbtn" data-act="closesheet">' + SVG.x + '</button></div>' +
+    '<p class="dim" style="margin:4px 0 14px">Remove this file from the release? People who already downloaded it keep their copy.</p>' +
+    '<button class="btn danger btnblock" id="daConfirm">Delete file</button>');
+  $('#daConfirm').addEventListener('click', async () => {
+    $('#daConfirm').disabled = true;
+    try {
+      await api('/repos/' + full + '/releases/assets/' + aid, { method: 'DELETE' });
+      closeSheet(); toast('Deleted ' + name);
+      const parts = full.split('/');
+      renderReleases(parts[0], parts[1]);
+    } catch (e) { toast('Failed: ' + e.message); $('#daConfirm').disabled = false; }
+  });
+}
+
+function deleteFileSheet(full, path, sha) {
+  const name = path.split('/').pop();
+  openSheet('<div class="sheethead"><b>Delete — ' + esc(name) + '</b><button class="iconbtn" data-act="closesheet">' + SVG.x + '</button></div>' +
+    '<label class="fldlabel">Commit message</label>' +
+    '<input class="fld" id="dfMsg" value="Delete ' + esc(name) + '" autocomplete="off">' +
+    '<p class="dim" style="margin:12px 4px 14px">Delete this file from the repository? This creates a commit — it can be reverted on GitHub but not undone from here.</p>' +
+    '<button class="btn danger btnblock" id="dfConfirm">Delete file</button>');
+  $('#dfConfirm').addEventListener('click', async () => {
+    $('#dfConfirm').disabled = true;
+    try {
+      await api('/repos/' + full + '/contents/' + path, { method: 'DELETE', body: JSON.stringify({ message: $('#dfMsg').value.trim() || ('Delete ' + name), sha }) });
+      closeSheet(); toast('Deleted ' + name);
+      const parts = full.split('/'), dir = path.split('/').slice(0, -1).join('/');
+      renderFiles(parts[0], parts[1], dir);
+    } catch (e) { toast('Failed: ' + e.message); $('#dfConfirm').disabled = false; }
+  });
+}
+
+function newReleaseSheet(o, n) {
+  openSheet('<div class="sheethead"><b>New release — ' + esc(n) + '</b><button class="iconbtn" data-act="closesheet">' + SVG.x + '</button></div>' +
+    '<label class="fldlabel">Tag version</label>' +
+    '<input class="fld" id="rlTag" placeholder="v1.0.0" autocomplete="off">' +
+    '<label class="fldlabel" style="margin-top:12px">Release title</label>' +
+    '<input class="fld" id="rlTitle" placeholder="Version 1.0.0" autocomplete="off">' +
+    '<label class="fldlabel" style="margin-top:12px">Describe this release</label>' +
+    '<textarea class="replyta" id="rlBody" placeholder="What is new in this release…"></textarea>' +
+    '<div class="seg" style="margin:16px 0 0"><button class="segb on" data-rls="final">Final</button><button class="segb" data-rls="pre">Pre-release</button><button class="segb" data-rls="draft">Draft</button></div>' +
+    '<label class="fldlabel" style="margin-top:20px">Attach files</label>' +
+    '<div class="lsub" style="margin-bottom:8px">Picked files upload with the release</div>' +
+    '<button class="btn ghost btnblock" id="rlFiles">Choose files</button>' +
+    '<div id="rlFileList" style="margin-top:6px"></div>' +
+    '<input type="file" id="rlInput" multiple hidden>' +
+    '<button class="btn primary btnblock" id="rlPublish" style="margin-top:18px">Publish release</button>');
+  let rls = 'final', pending = [];
+  const drawFiles = () => {
+    const el = $('#rlFileList');
+    if (!el) return;
+    el.innerHTML = pending.length ? pending.map((f, i) =>
+      '<div style="display:flex;align-items:center;gap:10px;padding:8px 0">' +
+      '<div class="lmain" style="flex:1;min-width:0"><div class="ltitle">' + esc(f.name) + '</div>' +
+      '<div class="lsub">' + (f.size > 1048576 ? (f.size / 1048576).toFixed(1) + ' MB' : Math.max(1, Math.round(f.size / 1024)) + ' KB') + '</div></div>' +
+      '<button class="iconbtn" data-rmfile="' + i + '" aria-label="remove">' + SVG.x + '</button></div>').join('') : '';
+  };
+  $$('[data-rls]').forEach(b => b.addEventListener('click', () => { rls = b.dataset.rls; $$('[data-rls]').forEach(x => x.classList.toggle('on', x === b)); }));
+  $('#rlFiles').addEventListener('click', () => $('#rlInput').click());
+  $('#rlInput').addEventListener('change', e => {
+    pending = pending.concat(Array.from(e.target.files || []));
+    e.target.value = '';
+    drawFiles();
+  });
+  $('#rlFileList').addEventListener('click', e => {
+    const b = e.target.closest('[data-rmfile]');
+    if (b) { pending.splice(+b.dataset.rmfile, 1); drawFiles(); }
+  });
+  $('#rlPublish').addEventListener('click', async () => {
+    const tag = $('#rlTag').value.trim();
+    if (!tag) { toast('Enter a tag like v1.0.0'); return; }
+    if (/[^A-Za-z0-9._\-+]/.test(tag)) { toast('Tags cannot contain spaces — use letters, numbers, dots, dashes (e.g. First-Stable)'); return; }
+    $('#rlPublish').disabled = true;
+    try {
+      const rel = await api('/repos/' + o + '/' + n + '/releases', { method: 'POST', body: JSON.stringify({ tag_name: tag, name: $('#rlTitle').value.trim() || tag, body: $('#rlBody').value, draft: rls === 'draft', prerelease: rls === 'pre' }) });
+      if (pending.length && rel && rel.id) {
+        toast('Release published — uploading ' + pending.length + ' file' + (pending.length > 1 ? 's' : '') + '…');
+        let done = 0;
+        for (const f of pending.slice()) {
+          try { await uploadAsset(o + '/' + n, rel.id, f); done++; }
+          catch (er) { toast('Failed: ' + f.name + ' — ' + er.message); }
+        }
+        toast('Release published with ' + done + ' file' + (done === 1 ? '' : 's'));
+      } else toast('Release published');
+      closeSheet();
+      renderReleases(o, n);
+    } catch (e) { toast('Failed: ' + e.message); $('#rlPublish').disabled = false; }
+  });
+}
+
+function editRepoSheet(o, n, r) {
+  openSheet('<div class="sheethead"><b>Edit repository</b><button class="iconbtn" data-act="closesheet">' + SVG.x + '</button></div>' +
+    '<label class="fldlabel">Repository name</label>' +
+    '<input class="fld" id="erName" value="' + esc(n) + '" autocomplete="off" spellcheck="false">' +
+    '<label class="fldlabel" style="margin-top:12px">Description</label>' +
+    '<input class="fld" id="erDesc" value="' + esc(r.description || '') + '" autocomplete="off">' +
+    '<label class="fldlabel" style="margin-top:12px">Homepage</label>' +
+    '<input class="fld" id="erHome" value="' + esc(r.homepage || '') + '" placeholder="https://…" autocomplete="off">' +
+    '<div class="setrow" style="margin-top:16px"><div class="lmain"><div class="ltitle">Private repository</div><div class="lsub">Only you and collaborators can see it</div></div><button class="switch' + (r.private ? ' on' : '') + '" id="erPriv"></button></div>' +
+    '<button class="btn primary btnblock" id="erSave" style="margin-top:18px">Save changes</button>' +
+    '<div class="lsub" style="margin:20px 0 8px;text-align:center">Danger zone</div>' +
+    '<button class="btn danger btnblock" id="erDelete">Delete repository</button>');
+  const pv = $('#erPriv');
+  pv.addEventListener('click', () => pv.classList.toggle('on'));
+  $('#erSave').addEventListener('click', async () => {
+    const newName = $('#erName').value.trim();
+    if (!newName) { toast('Repository name cannot be empty'); return; }
+    if (!/^[A-Za-z0-9._-]+$/.test(newName)) { toast('Name can only use letters, numbers, . _ and -'); return; }
+    if (newName.length > 100) { toast('Name is too long (max 100 characters)'); return; }
+    $('#erSave').disabled = true;
+    try {
+      const upd = await api('/repos/' + o + '/' + n, { method: 'PATCH', body: JSON.stringify({ name: newName, description: $('#erDesc').value.trim(), homepage: $('#erHome').value.trim(), private: pv.classList.contains('on') }) });
+      closeSheet();
+      const finalName = (upd && upd.name) ? upd.name : newName;
+      if (finalName !== n) {
+        /* keep pins pointing at the renamed repo */
+        let rePinned = false;
+        pins.forEach(p => { if (p.full_name === o + '/' + n) { p.full_name = o + '/' + finalName; p.name = finalName; rePinned = true; } });
+        if (rePinned) { LS.set('pins', pins); queueSync(); }
+        toast('Repository renamed to ' + finalName);
+        location.hash = '#/repo/' + o + '/' + finalName;
+      } else {
+        toast('Repository updated');
+        renderRepo(o, n);
+      }
+    } catch (e) { toast('Failed: ' + e.message); $('#erSave').disabled = false; }
+  });
+  $('#erDelete').addEventListener('click', () => deleteRepoSheet(o, n));
+}
+
+function upProgShow(title) {
+  let el = document.getElementById('upProgCard');
+  if (!el) { el = document.createElement('div'); el.id = 'upProgCard'; document.body.appendChild(el); }
+  el.innerHTML = '<div class="ltitle">' + esc(title) + '</div><div class="lsub" id="upProgSub" style="margin-top:3px"></div><div class="upbar"><i id="upProgBar" style="width:0%"></i></div>';
+}
+function upProgUpdate(sub, pct) {
+  const s = document.getElementById('upProgSub'), b = document.getElementById('upProgBar');
+  if (s) s.textContent = sub;
+  if (b) b.style.width = Math.max(0, Math.min(100, Math.round(pct))) + '%';
+}
+function upProgHide() { const el = document.getElementById('upProgCard'); if (el) el.remove(); }
+let folderCtx = null;
+/* native scan result: folder walked or files picked — offer the commit sheet.
+ * count < 0 means the picker was cancelled; tooBig counts files over
+ * GitHub's 100 MB per-file limit; truncated means the 2000-file cap was hit. */
+window.__folderScanned = (jid, count, bytes, tooBig, truncated) => {
+  if (!folderCtx) return;
+  if (folderCtx.jid === null) folderCtx.jid = jid;
+  if (jid !== folderCtx.jid) return;
+  if (count < 0) { folderCtx = null; upProgHide(); toast('Upload cancelled'); return; }
+  if (count === 0) { folderCtx = null; upProgHide(); toast(tooBig > 0 ? 'Every file in there is over 100 MB — GitHub refuses files that big' : 'No files found to upload'); return; }
+  if (truncated) toast('More than 2000 files — uploading the first 2000');
+  if (tooBig > 0) toast(tooBig + ' file' + (tooBig > 1 ? 's' : '') + ' over 100 MB skipped — GitHub refuses files that big');
+  const ctx = folderCtx;
+  upProgUpdate(count + ' files — ' + fmtSize(bytes) + ' ready', 100);
+  commitMsgSheet('Upload ' + (ctx.kind === 'folder' ? 'folder' : 'files'), 'Upload ' + count + ' file' + (count === 1 ? '' : 's'), async msg => {
+    if (!window.OneGit || !window.OneGit.uploadFolder) { folderCtx = null; upProgHide(); toast('Upload not available'); return; }
+    upProgUpdate('Uploading 0 / ' + count, 2);
+    try { window.OneGit.uploadFolder(jid, ctx.o, ctx.n, ctx.dir || '', msg); }
+    catch (e) { folderCtx = null; upProgHide(); toast('Failed: ' + e.message); }
+  }, () => { folderCtx = null; upProgHide(); toast('Upload cancelled'); });
+};
+window.__folderProgress = (jid, done, total) => {
+  if (!folderCtx || folderCtx.jid !== jid) return;
+  upProgUpdate('Uploading ' + done + ' / ' + total + (total === 1 ? ' file' : ' files'), total ? done / total * 100 : 100);
+};
+window.__folderStage = (jid, text) => {
+  if (!folderCtx || folderCtx.jid !== jid) return;
+  upProgUpdate(text, 100);
+};
+window.__folderResult = (jid, ok, fail, errs) => {
+  if (!folderCtx || folderCtx.jid !== jid) return;
+  const ctx = folderCtx; folderCtx = null;
+  upProgHide();
+  let m = '';
+  try { const a = typeof errs === 'string' ? JSON.parse(errs) : errs; if (a && a.length) m = a.slice(0, 3).join(' · '); } catch (e) {}
+  if (fail > 0) toast(ok + ' uploaded, ' + fail + ' failed' + (m ? ' — ' + m : ''));
+  else toast('Uploaded ' + ok + ' file' + (ok === 1 ? '' : 's') + ' in one commit');
+  try { if (window.OneGit && window.OneGit.notify) window.OneGit.notify('Upload complete', ok + ' of ' + (ok + fail) + ' files uploaded to ' + ctx.o + '/' + ctx.n); } catch (e) {}
+  renderFiles(ctx.o, ctx.n, ctx.dir);
+};
+/* native release-asset upload finished (window._assetAfter re-renders the view) */
+window.__assetDone = (ok, fail, msg) => {
+  toast(fail > 0 ? (ok + ' uploaded, ' + fail + ' failed' + (msg ? ' — ' + msg : '')) : 'Uploaded ' + ok + ' file' + (ok === 1 ? '' : 's'));
+  const after = window._assetAfter; window._assetAfter = null;
+  if (after) { try { after(); } catch (e) {} }
+};
+/* commits many files as ONE commit via the Git Data API (blobs -> tree -> commit) */
+async function commitMany(o, n, files, dir, message, onProg) {
+  const repo = await api('/repos/' + o + '/' + n);
+  const branch = repo.default_branch || 'main';
+  let ref;
+  try { ref = await api('/repos/' + o + '/' + n + '/git/ref/heads/' + branch); }
+  catch (e) {
+    // repository has no commits yet: create files via the contents API
+    for (let i = 0; i < files.length; i++) {
+      await api('/repos/' + o + '/' + n + '/contents/' + encodeURIComponent((dir ? dir + '/' : '') + files[i].path).replace(/%2F/g, '/'),
+        { method: 'PUT', body: JSON.stringify({ message: message + (files.length > 1 ? ' \u2014 ' + files[i].path : ''), content: files[i].b64, branch }) });
+      if (onProg) onProg(i + 1, files.length);
+    }
+    return files.length;
+  }
+  const parentSha = ref.object.sha;
+  const headCommit = await api('/repos/' + o + '/' + n + '/git/commits/' + parentSha);
+  const baseTree = headCommit.tree.sha;
+  const tree = [];
+  for (let i = 0; i < files.length; i += 6) {
+    const chunk = files.slice(i, i + 6);
+    const blobs = await Promise.all(chunk.map(f => api('/repos/' + o + '/' + n + '/git/blobs', { method: 'POST', body: JSON.stringify({ content: f.b64, encoding: 'base64' }) })));
+    blobs.forEach((b, k) => tree.push({ path: (dir ? dir + '/' : '') + chunk[k].path, mode: '100644', type: 'blob', sha: b.sha }));
+    if (onProg) onProg(Math.min(i + 6, files.length), files.length);
+  }
+  const newTree = await api('/repos/' + o + '/' + n + '/git/trees', { method: 'POST', body: JSON.stringify({ base_tree: baseTree, tree }) });
+  const newCommit = await api('/repos/' + o + '/' + n + '/git/commits', { method: 'POST', body: JSON.stringify({ message, tree: newTree.sha, parents: [parentSha] }) });
+  await api('/repos/' + o + '/' + n + '/git/refs/heads/' + branch, { method: 'PATCH', body: JSON.stringify({ sha: newCommit.sha }) });
+  return files.length;
+}
+
+function deleteRepoSheet(o, n) {
+  openSheet('<div class="sheethead"><b>Delete repository — ' + esc(n) + '</b><button class="iconbtn" data-act="closesheet">' + SVG.x + '</button></div>' +
+    '<p class="dim" style="margin:4px 0 14px">This permanently deletes ' + esc(o + '/' + n) + ' — every file, issue, pull request, star and setting is gone for good. This cannot be undone, not even on GitHub.</p>' +
+    '<label class="fldlabel">Type ' + esc(n) + ' to confirm</label>' +
+    '<input class="fld" id="drConfirm" placeholder="' + esc(n) + '" autocomplete="off" spellcheck="false">' +
+    '<button class="btn danger btnblock" id="drGo" style="margin-top:16px">Delete this repository</button>');
+  $('#drConfirm').addEventListener('keydown', e => { if (e.key === 'Enter') $('#drGo').click(); });
+  $('#drGo').addEventListener('click', async () => {
+    if ($('#drConfirm').value.trim() !== n) { toast('Type ' + n + ' to confirm'); return; }
+    $('#drGo').disabled = true;
+    try {
+      await api('/repos/' + o + '/' + n, { method: 'DELETE' });
+      closeSheet();
+      toast('Deleted ' + o + '/' + n);
+      pins = pins.filter(p => p.full_name !== o + '/' + n); LS.set('pins', pins); queueSync();
+      location.hash = '#/repos';
+    } catch (e) { toast('Failed: ' + e.message); $('#drGo').disabled = false; }
+  });
+}
+
+/* ================= views: issue / PR detail ================= */
+async function renderIssue(o, n, num) {
+  const seq = ++RSEQ;
+  if (seq !== RSEQ) return;
+  view().innerHTML = spinner();
+  let iss, comments;
+  try {
+    iss = await api('/repos/' + o + '/' + n + '/issues/' + num, { accept: 'application/vnd.github.html+json' });
+    comments = await api('/repos/' + o + '/' + n + '/issues/' + num + '/comments?per_page=50', { accept: 'application/vnd.github.html+json' });
+  } catch (e) { if (seq !== RSEQ) return; view().innerHTML = errCard(e); return; }
+  const isPR = !!iss.pull_request;
+  let pr = null;
+  if (isPR) pr = await api('/repos/' + o + '/' + n + '/pulls/' + num).catch(() => null);
+  let html = '<div class="card issuehead"><div class="chips">' +
+    '<span class="chip ' + (iss.state === 'open' ? 'ok' : 'closed') + '">' + (iss.state === 'open' ? 'Open' : 'Closed') + '</span>' +
+    (isPR ? '<span class="chip pr">Pull Request</span>' : '') +
+    (pr && pr.draft ? '<span class="chip">Draft</span>' : '') +
+    (pr && pr.merged_at ? '<span class="chip ok">Merged</span>' : '') + '</div>' +
+    '<div class="ihtitle">' + esc(iss.title) + '</div>' +
+    '<div class="ihmeta">' + esc(iss.user.login) + ' opened ' + tAgo(iss.created_at) +
+    (isPR && iss.pull_request.merged_at ? ' · merged' : '') + '</div>' +
+    (pr ? '<div class="ihmeta" style="margin-top:4px">' + esc(pr.head.ref) + ' → ' + esc(pr.base.ref) +
+      (pr.additions !== undefined ? ' · <span style="color:#12B76A">+' + nf(pr.additions) + '</span> <span style="color:#EF4444">−' + nf(pr.deletions) + '</span> · ' + nf(pr.changed_files) + ' files' : '') + '</div>' : '') +
+    '<button class="btn ' + (iss.state === 'open' ? 'ghost' : 'primary') + '" id="stateBtn" style="margin-top:14px">' +
+    (iss.state === 'open' ? (isPR ? 'Close pull request' : 'Close issue') : (isPR ? 'Reopen pull request' : 'Reopen issue')) + '</button>' +
+    (pr && iss.state === 'open' && !pr.merged_at ? '<button class="btn primary" id="mergeBtn" style="margin-top:10px">Merge pull request</button>' : '') + '</div>';
+  html += '<div class="card md">' + (iss.body_html ? fixMd(iss.body_html, o + '/' + n) : '<p class="dim">No description.</p>') + '</div>';
+  html += '<h2 class="sect">Comments (' + comments.length + ')</h2>';
+  comments.forEach(c => {
+    html += '<div class="card comment"><div class="crow"><img class="cav" src="' + esc(c.user.avatar_url) + '" alt=""><b data-go="#/user/' + esc(c.user.login) + '">' + esc(c.user.login) + '</b><span class="dim">' + tAgo(c.created_at) + '</span></div>' +
+      '<div class="md">' + (c.body_html ? fixMd(c.body_html, o + '/' + n) : '') + '</div></div>';
+  });
+  html += '<div class="card reply"><textarea id="replyText" placeholder="Write a comment…"></textarea><button class="btn primary" id="replyBtn">Comment</button></div>';
+  if (seq !== RSEQ) return;
+  view().innerHTML = html;
+  inlineRepoImages(view());
+  const sb = $('#stateBtn');
+  if (sb) sb.addEventListener('click', async () => {
+    sb.disabled = true;
+    const target = iss.state === 'open' ? 'closed' : 'open';
+    try {
+      await api('/repos/' + o + '/' + n + '/issues/' + num, { method: 'PATCH', body: JSON.stringify({ state: target }) });
+      toast(target === 'closed' ? 'Closed' : 'Reopened');
+      renderIssue(o, n, num);
+    } catch (e) { toast('Failed: ' + e.message); sb.disabled = false; }
+  });
+  $('#replyBtn').addEventListener('click', async () => {
+    const body = $('#replyText').value.trim();
+    if (!body) { toast('Write something first'); return; }
+    $('#replyBtn').disabled = true;
+    try {
+      await api('/repos/' + o + '/' + n + '/issues/' + num + '/comments', { method: 'POST', body: JSON.stringify({ body }) });
+      toast('Comment posted');
+      renderIssue(o, n, num);
+    } catch (e) { toast('Failed: ' + e.message); $('#replyBtn').disabled = false; }
+  });
+  const mb = $('#mergeBtn');
+  if (mb && pr) mb.addEventListener('click', async () => {
+    const canMerge = await canPushRepo(o, n).catch(() => false);
+    if (!canMerge) { toast('You do not have permission to merge here'); return; }
+    mergeSheet(o, n, num, pr);
+  });
+}
+
+/* ================= views: global issues + PRs ================= */
+let IS = { type: 'issues', state: 'open', filter: 'created' };
+async function renderIssues() {
+  const seq = ++RSEQ;
+  if (seq !== RSEQ) return;
+  view().innerHTML = '<button class="btn ghost btnblock" id="giNew" style="margin-bottom:12px">New issue</button>' +
+    '<div class="seg sm"><button class="segb' + (IS.type === 'issues' ? ' on' : '') + '" data-it="issues">Issues</button>' +
+    '<button class="segb' + (IS.type === 'prs' ? ' on' : '') + '" data-it="prs">Pull requests</button></div>' +
+    '<div class="seg sm"><button class="segb' + (IS.state === 'open' ? ' on' : '') + '" data-is="open">Open</button>' +
+    '<button class="segb' + (IS.state === 'closed' ? ' on' : '') + '" data-is="closed">Closed</button></div>' +
+    '<div class="seg sm" style="margin-bottom:12px"><button class="segb' + (IS.filter === 'created' ? ' on' : '') + '" data-if="created">Created</button>' +
+    '<button class="segb' + (IS.filter === 'assigned' ? ' on' : '') + '" data-if="assigned">Assigned</button></div>' +
+    sortRowHTML('issues') +
+    '<div id="issueList">' + spinner() + '</div>';
+  $('#giNew').addEventListener('click', () => repoPickerSheet((o, n) => { closeSheet(); newIssueSheet(o, n); }));
+  $$('[data-if]').forEach(b => b.addEventListener('click', () => { IS.filter = b.dataset.if; renderIssues(); }));
+  $$('[data-is]').forEach(b => b.addEventListener('click', () => { IS.state = b.dataset.is; renderIssues(); }));
+  $$('[data-it]').forEach(b => b.addEventListener('click', () => { IS.type = b.dataset.it; renderIssues(); }));
+  wireSortRow('issues', () => loadIssues());
+  loadIssues();
+}
+async function loadIssues() {
+  const seq = ++RSEQ;
+  const list = $('#issueList'); if (!list) return;
+  const paintIssues = items => {
+    const it = sortItems((items || []).filter(i => IS.type === 'prs' ? !!i.pull_request : !i.pull_request), 'issues');
+    if (seq !== RSEQ) return;
+    list.innerHTML = it.length ? '<div class="card list">' + it.map(issueRow).join('') + '</div>' :
+      '<div class="card empty">No ' + (IS.type === 'prs' ? 'pull requests' : 'issues') + ' here.</div>';
+  };
+  const ic = cached('/issues?filter=' + IS.filter + '&state=' + IS.state + '&sort=updated&direction=desc&per_page=60');
+  if (ic && Array.isArray(ic)) paintIssues(ic);
+  try {
+    let items = await api('/issues?filter=' + IS.filter + '&state=' + IS.state + '&sort=updated&direction=desc&per_page=60');
+    paintIssues(items);
+  } catch (e) { if (seq !== RSEQ) return; list.innerHTML = errCard(e); }
+}
+
+/* ================= views: notifications ================= */
+let NT = { all: false };
+async function renderNotifs() {
+  const seq = ++RSEQ;
+  if (seq !== RSEQ) return;
+  view().innerHTML = '<div class="seg sm"><button class="segb' + (NT.all ? '' : ' on') + '" data-ns="unread">Unread</button><button class="segb' + (NT.all ? ' on' : '') + '" data-ns="all">All</button></div>' +
+    '<button class="btn ghost btnblock" id="markAll" style="margin-bottom:12px">Mark all as read</button><div id="notifList">' + spinner() + '</div>';
+  $$('[data-ns]').forEach(b => b.addEventListener('click', () => { NT.all = b.dataset.ns === 'all'; renderNotifs(); }));
+  let items;
+  try { items = await api('/notifications?per_page=50' + (NT.all ? '&all=true' : '')); } catch (e) { if (seq !== RSEQ) return; $('#notifList').innerHTML = errCard(e); return; }
+  let html = '';
+  if (!items.length) html = '<div class="card empty">All caught up — nothing new.</div>';
+  else {
+    html = '<div class="card list">';
+    items.forEach(nt => {
+      html += '<div class="lrow' + (nt.unread ? ' unread' : '') + '" data-act="opennotif" data-id="' + nt.id + '" data-url="' + esc(nt.subject.url) + '">' +
+        '<div class="ndot"></div><div class="lmain"><div class="ltitle">' + esc(nt.subject.title) + '</div>' +
+        '<div class="lsub">' + esc(nt.repository.full_name) + ' · ' + esc(nt.subject.type) + ' · ' + esc(nt.reason) + ' · ' + tAgo(nt.updated_at) + '</div></div></div>';
+    });
+    html += '</div>';
+  }
+  NT_UNREAD = (items || []).filter(n => n.unread).length;
+  widgetPush();
+  const nl = $('#notifList');
+  if (nl && seq === RSEQ) nl.innerHTML = html;
+  $('#markAll').addEventListener('click', async () => {
+    try { await api('/notifications', { method: 'PUT' }); toast('All marked as read'); renderNotifs(); } catch (e) { toast('Failed: ' + e.message); }
+  });
+}
+
+/* ================= views: user profile ================= */
+/* profile README only - what the profile card opens */
+async function renderProfileReadme(login) {
+  const seq = ++RSEQ;
+  view().innerHTML = spinner();
+  const res = await Promise.allSettled([
+    api('/repos/' + login + '/' + login + '/readme', { accept: 'application/vnd.github.html', text: true }),
+    api('/users/' + login)
+  ]);
+  if (seq !== RSEQ) return;
+  if (res[0].status !== 'fulfilled') {
+    view().innerHTML = '<div class="card empty">@' + esc(login) + ' has no profile README yet.<br><span class="dim">A profile README appears when there is a public repository named exactly like the username, with a README.md inside it. You can create one from the Repos tab — New repository.</span></div>';
+    return;
+  }
+  const md = res[0].value;
+  const u = res[1].status === 'fulfilled' ? res[1].value : null;
+  let html = '';
+  if (u) {
+    html += '<div class="card profile" data-go="#/user/' + esc(login) + '"><img class="pav" src="' + esc(u.avatar_url) + '" alt="">' +
+      '<div class="pname">' + esc(u.name || u.login) + '</div>' +
+      '<div class="plogin">@' + esc(u.login) + '</div>' +
+      (u.bio ? '<p class="pbio">' + esc(u.bio) + '</p>' : '') + '</div>';
+  }
+  html += '<div class="card md">' + fixMd(md, login + '/' + login) + '</div>';
+  view().innerHTML = html;
+  inlineRepoImages(view());
+}
+
+async function renderUser(login) {
+  const seq = ++RSEQ;
+  if (seq !== RSEQ) return;
+  view().innerHTML = spinner();
+  let u = cached('/users/' + login) || null, repos = cached('/users/' + login + '/repos?per_page=100&sort=pushed') || null, followState = null;
+  const self = (USER && USER.login) ? USER.login.toLowerCase() === login.toLowerCase() : true;
+  if (u) api('/users/' + login).catch(() => {});
+  if (!u) { try { u = await api('/users/' + login); } catch (e) { if (seq !== RSEQ) return; view().innerHTML = errCard(e); return; } }
+  if (!self) { const f = await api('/user/following/' + login, { status: true }).catch(() => null); followState = f ? f.status === 204 : null; }
+  if (repos) api('/users/' + login + '/repos?per_page=100&sort=pushed').catch(() => {});
+  else { try { repos = await api('/users/' + login + '/repos?per_page=100&sort=pushed'); } catch (e) { repos = []; } }
+  repos.sort((a, b) => (b.stargazers_count || 0) - (a.stargazers_count || 0));
+  const top = repos.slice(0, 8);
+  let html = '<div class="card profile" data-go="' + specialRepoGo(login) + '"><button class="pavalert" data-go="#/notifs" aria-label="Alerts">' + SVG.bell + '</button><img class="pav" src="' + esc(u.avatar_url) + '" alt="">' +
+    '<div class="pname">' + esc(u.name || u.login) + '</div>' +
+    '<div class="plogin">@' + esc(u.login) + (u.type === 'Organization' ? ' · organization' : '') + '</div>' +
+    (u.bio ? '<p class="pbio">' + esc(u.bio) + '</p>' : '') +
+    (u.location ? '<p class="pbio" style="margin-top:6px;font-size:12.5px">' + esc(u.location) + '</p>' : '') +
+    '<div class="pstats">' +
+    '<div class="pstat" data-go="#/users/' + esc(u.login) + '/repos"><b>' + nf(u.public_repos) + '</b><span>repos</span></div>' +
+    '<div class="pstat" data-go="#/users/' + esc(u.login) + '/followers"><b>' + nf(u.followers) + '</b><span>followers</span></div>' +
+    '<div class="pstat" data-go="#/users/' + esc(u.login) + '/following"><b>' + nf(u.following) + '</b><span>following</span></div></div>';
+  if (!self) {
+    html += '<button class="btn follow ' + (followState ? 'on' : 'primary') + '" id="followBtn">' + (followState ? 'Following' : 'Follow') + '</button>';
+  } else {
+    html += '<button class="btn ghost" id="editProfBtn" style="margin-top:14px">Edit profile</button>';
+  }
+  html += '<div class="linkrow"><button class="btn sm ghost" data-act="ext" data-url="' + esc(u.html_url) + '">Open on GitHub</button></div>';
+  html += '</div>';
+  html += '<div id="preReadme"></div>';
+  html += '<h2 class="sect">Popular repositories</h2>';
+  html += top.length ? top.map(repoRow).join('') : '<div class="card empty">No public repositories.</div>';
+  if (seq !== RSEQ) return;
+  view().innerHTML = html;
+  checkSpecialRepo(login);
+  (async () => {
+    try {
+      const md = await api('/repos/' + login + '/' + login + '/readme', { accept: 'application/vnd.github.html', text: true });
+      const el = $('#preReadme');
+      if (el && seq === RSEQ) { el.innerHTML = '<h2 class="sect">Profile README</h2><div class="card md">' + fixMd(md, login + '/' + login) + '</div>'; inlineRepoImages(el); }
+    } catch (e) { /* no special repo - nothing to show */ }
+  })();
+  const fb = $('#followBtn');
+  if (fb) fb.addEventListener('click', async e => {
+    e.stopPropagation();
+    if (USER && USER.login && USER.login.toLowerCase() === login.toLowerCase()) { toast('You cannot follow yourself'); return; }
+    fb.disabled = true;
+    const following = fb.classList.contains('on');
+    try {
+      await api('/user/following/' + login, { method: following ? 'DELETE' : 'PUT' });
+      fb.classList.toggle('on', !following);
+      fb.classList.remove('primary');
+      fb.textContent = following ? 'Follow' : 'Following';
+      toast(following ? 'Unfollowed ' + login : 'Following ' + login);
+    } catch (e) {
+      if (/not found/i.test(e.message || '')) {
+        toast('Could not follow ' + login + ' \u2014 this is usually your own profile');
+        try {
+          const me = await api('/user');
+          if (me && me.login) { USER = me; LS.set('c.user', me); route(); return; }
+        } catch (e2) {}
+      } else toast('Failed: ' + e.message);
+      fb.disabled = false;
+    }
+  });
+  const eb = $('#editProfBtn');
+  if (eb) eb.addEventListener('click', e => { e.stopPropagation(); editProfileSheet(); });
+}
+
+/* ================= views: user lists (followers / following) ================= */
+/* A user's own repositories - what tapping the "repos" count on their profile
+   opens. It used to jump to the Repositories tab, which showed your own or the
+   Discover list instead of theirs. */
+let URSORT = 'stars';
+async function renderUserRepos(login) {
+  const seq = ++RSEQ;
+  view().innerHTML = spinner();
+  let repos = cached('/users/' + login + '/repos?per_page=100&sort=pushed') || null;
+  if (!repos) {
+    try { repos = await api('/users/' + login + '/repos?per_page=100&sort=pushed'); }
+    catch (e) { if (seq === RSEQ) view().innerHTML = errCard(e); return; }
+  } else {
+    api('/users/' + login + '/repos?per_page=100&sort=pushed').catch(() => {});
+  }
+  if (seq !== RSEQ) return;
+  const sorters = {
+    stars: (a, b) => (b.stargazers_count || 0) - (a.stargazers_count || 0),
+    updated: (a, b) => new Date(b.pushed_at || 0) - new Date(a.pushed_at || 0),
+    name: (a, b) => String(a.name || '').localeCompare(String(b.name || ''))
+  };
+  const list = (repos || []).slice().sort(sorters[URSORT] || sorters.stars);
+  let html = '<div class="seg sm" style="margin-bottom:12px">' +
+    [['stars', 'Most stars'], ['updated', 'Recently updated'], ['name', 'Name A–Z']].map(x =>
+      '<button class="segb' + (URSORT === x[0] ? ' on' : '') + '" data-ursort="' + x[0] + '">' + x[1] + '</button>').join('') + '</div>';
+  html += '<div class="lsub" style="margin:-4px 0 10px 2px">' + nf((repos || []).length) + ' public repositories by @' + esc(login) + '</div>';
+  /* the rows are cards in their own right, so there is no big container card
+     behind them any more - the list sits straight on the page like GitHub's */
+  html += list.length ? '<div class="repogrid">' + list.map(r => repoRow(r)).join('') + '</div>'
+    : '<div class="card empty">@' + esc(login) + ' has no public repositories.</div>';
+  view().innerHTML = html;
+  $$('[data-ursort]').forEach(b => b.addEventListener('click', () => { URSORT = b.dataset.ursort; renderUserRepos(login); }));
+}
+
+async function renderUserList(login, which) {
+  const seq = ++RSEQ;
+  if (seq !== RSEQ) return;
+  view().innerHTML = spinner();
+  let items;
+  try { items = await api('/users/' + login + '/' + which + '?per_page=80'); }
+  catch (e) { if (seq !== RSEQ) return; view().innerHTML = errCard(e); return; }
+  if (seq !== RSEQ) return;
+  view().innerHTML = items.length ? '<div class="card list">' + items.map(u =>
+    '<div class="lrow" data-go="#/user/' + esc(u.login) + '">' +
+    '<img class="cav" src="' + esc(u.avatar_url) + '" alt="">' +
+    '<div class="lmain"><div class="ltitle">' + esc(u.login) + '</div>' +
+    '<div class="lsub">' + esc(u.type || 'User') + '</div></div></div>').join('') + '</div>'
+    : '<div class="card empty">Nobody here yet.</div>';
+}
+
+/* ================= views: gists ================= */
+async function renderGists(login) {
+  const seq = ++RSEQ;
+  if (seq !== RSEQ) return;
+  view().innerHTML = spinner();
+  let items;
+  try { items = await api(login ? '/users/' + login + '/gists?per_page=30' : '/gists?per_page=30'); }
+  catch (e) { if (seq !== RSEQ) return; view().innerHTML = errCard(e); return; }
+  if (!items.length) { view().innerHTML = (login ? '' : '<button class="btn ghost btnblock" id="newGistBtn" style="margin-bottom:12px">New gist</button>') + '<div class="card empty">No gists yet.</div>'; if (!login) $('#newGistBtn').addEventListener('click', newGistSheet); return; }
+  if (seq !== RSEQ) return;
+  view().innerHTML = (login ? '' : '<button class="btn ghost btnblock" id="newGistBtn" style="margin-bottom:12px">New gist</button>') + '<div class="card list">' + items.map(g => {
+    const files = Object.keys(g.files || {});
+    const label = g.description || files[0] || 'gist';
+    return '<div class="lrow" data-go="#/gist/' + g.id + '">' + SVG.file +
+      '<div class="lmain"><div class="ltitle">' + esc(label) + '</div>' +
+      '<div class="lsub">' + files.length + ' file' + (files.length > 1 ? 's' : '') + ' · ' + tAgo(g.updated_at) + (g.public ? '' : ' · secret') + '</div></div></div>';
+  }).join('') + '</div>';
+}
+
+async function renderGist(id) {
+  const seq = ++RSEQ;
+  if (seq !== RSEQ) return;
+  view().innerHTML = spinner();
+  let g;
+  try { g = await api('/gists/' + id); } catch (e) { if (seq !== RSEQ) return; view().innerHTML = errCard(e); return; }
+  const files = Object.values(g.files || {});
+  let html = '<div class="card"><div class="rcname">' + esc(g.description || 'Gist') + '</div>' +
+    '<div class="rcmeta">' + (g.owner ? esc(g.owner.login) : 'anonymous') + ' · ' + tAgo(g.updated_at) + (g.public ? '' : ' · secret gist') + '</div></div>';
+  files.forEach(f => {
+    html += '<div class="card"><div class="filehead">' + SVG.file + '<b style="font-size:13px;word-break:break-all">' + esc(f.filename) + '</b>' +
+      (f.language ? '<span class="chip">' + esc(f.language) + '</span>' : '') + '</div>' +
+      (f.truncated ? '<div class="lsub" style="margin-top:8px">File too large to show here.</div>' :
+        '<pre class="filepre">' + esc(f.content || '') + '</pre>') + '</div>';
+  });
+  if (seq !== RSEQ) return;
+  view().innerHTML = html;
+}
+
+function langBars(langs) {
+  const entries = Object.entries(langs).sort((a, b) => b[1] - a[1]);
+  const total = entries.reduce((s, e) => s + e[1], 0) || 1;
+  const top = entries.slice(0, 4);
+  const rest = entries.slice(4).reduce((s, e) => s + e[1], 0);
+  let bar = '<div class="langbar">' + top.map(e => '<span style="width:' + (e[1] / total * 100).toFixed(1) + '%;background:' + langColor(e[0]) + '"></span>').join('') +
+    (rest ? '<span style="width:' + (rest / total * 100).toFixed(1) + '%;background:#8a8a8a"></span>' : '') + '</div>';
+  let legend = top.map(e => '<div class="lgd"><span class="dot" style="background:' + langColor(e[0]) + '"></span>' + esc(e[0]) + ' <span class="dim">' + (e[1] / total * 100).toFixed(1) + '%</span></div>').join('') +
+    (rest ? '<div class="lgd"><span class="dot" style="background:#8a8a8a"></span>Other <span class="dim">' + (rest / total * 100).toFixed(1) + '%</span></div>' : '');
+  return '<div class="card"><div class="ltitle" style="margin-bottom:12px">Languages</div>' + bar + '<div class="lgdrow">' + legend + '</div></div>';
+}
+
+/* ================= views: settings ================= */
+let STAB = 'general';
+/* ================= GitHub account settings ================= */
+function renderSettings() {
+  const seq = ++RSEQ;
+  const u = USER || {};
+  let html = '<div class="seg" id="setSeg" style="margin-bottom:16px"><button class="segb' + (STAB === 'credits' ? '' : ' on') + '" data-st="general">Settings</button><button class="segb' + (STAB === 'credits' ? ' on' : '') + '" data-st="credits">Credits</button></div>';
+  const wireTabs = () => $$('[data-st]').forEach(b => b.addEventListener('click', () => { STAB = b.dataset.st; renderSettings(); }));
+  if (STAB === 'credits') {
+    html += '<div class="card" style="text-align:center;padding:28px 20px">' +
+      '<div style="font-size:34px;font-weight:800;letter-spacing:-0.5px">Gitly</div>' +
+      '<ul class="creditslist" style="list-style:none;text-align:left;margin:16px auto 0;padding:0;max-width:290px">' +
+      '<li class="lsub" style="padding:7px 0 7px 18px;position:relative;border-bottom:1px solid var(--divider)">Version ' + APPV + '</li>' +
+      '<li class="lsub" style="padding:7px 0 7px 18px;position:relative;border-bottom:1px solid var(--divider)">Syncs via your GitHub account</li>' +
+      '<li class="lsub" style="padding:7px 0 7px 18px;position:relative">Not affiliated with GitHub</li></ul></div>' +
+      '<h2 class="sect">Developer</h2>' +
+      '<div class="card" style="text-align:center">' +
+      '<img src="logo.jpg" alt="BonkerUnkil (Bonki)" style="width:96px;height:96px;border-radius:32px;margin:0 auto 16px;box-shadow:0 8px 28px var(--glow)">' +
+      '<div style="padding:8px 0;border-bottom:1px solid var(--divider)"><div class="ltitle">Name</div><div class="lsub" style="margin-top:2px">BonkerUnkil (Bonki)</div></div>' +
+      '<div style="padding:8px 0;border-bottom:1px solid var(--divider)"><div class="ltitle">Age</div><div class="lsub" style="margin-top:2px">20</div></div>' +
+      '<div style="padding:8px 0"><div class="ltitle">Profession</div><div class="lsub" style="margin-top:2px">Coding, problem solving, and more</div></div></div>' +
+      '<h2 class="sect">Connect</h2>' +
+      '<div class="card">' +
+      '<button class="btn ghost btnblock" data-act="ext" data-url="https://t.me/BonkerUnkilBonki" style="display:flex;align-items:center;justify-content:flex-start;gap:12px">' + SVG.telegram + '<span>Telegram · @BonkerUnkilBonki</span></button>' +
+      '<button class="btn ghost btnblock" data-act="ext" data-url="https://github.com/BonkerUnkilBonki" style="display:flex;align-items:center;justify-content:flex-start;gap:12px;margin-top:8px">' + SVG.github + '<span>GitHub · @BonkerUnkilBonki</span></button></div>' +
+      '<h2 class="sect">Languages used</h2>' +
+      '<div class="card"><div class="chips"><span class="chip">HTML</span><span class="chip">CSS</span><span class="chip">JavaScript</span><span class="chip">Java</span></div></div>';
+    if (seq !== RSEQ) return;
+    view().innerHTML = html;
+    wireTabs();
+    return;
+  }
+  const cur = LS.get('theme', 'light');
+  html += '<h2 class="sect">GitHub account</h2><div class="card">' +
+    '<div class="lrow" style="padding:12px 0"><div class="lmain"><div class="ltitle">Sign-in method</div><div class="lsub lsubwrap">' + esc(loginMethodLabel()) +
+    (TOKEN_SCOPES ? ' · scopes: ' + esc(TOKEN_SCOPES) : (loginMethod() === 'fine' ? ' · permissions are chosen per token on github.com' : '')) + '</div></div></div></div>';
+  const themes = { light: 'Light', dark: 'Dark', pitch: 'Pitch black' };
+  const accents = { blue: ['#1B6EF3', 'Blue'], purple: ['#8B5CF6', 'Purple'], green: ['#12B76A', 'Green'], pink: ['#EC4899', 'Pink'], amber: ['#F59E0B', 'Amber'], teal: ['#14B8A6', 'Teal'], red: ['#EF4444', 'Red'], indigo: ['#6366F1', 'Indigo'], dynamic: ['', 'Dynamic'], custom: ['', 'Custom'] };
+  const curA = LS.get('accent', 'blue');
+  const curCustom = (LS.get('customAccent', '') || '').toUpperCase();
+  html += '<div class="card profile"><img class="pav" src="' + esc(u.avatar_url || '') + '" alt=""><div class="pname">' + esc(u.name || u.login || '') + '</div><div class="plogin">@' + esc(u.login || '') + '</div></div>';
+  html += '<h2 class="sect">Appearance</h2>';
+  html += '<div class="card"><div class="setrow"><div class="lmain"><div class="ltitle">Theme</div><div class="lsub">Pitch black saves battery on AMOLED screens</div></div></div>' +
+    '<div class="seg" style="margin:14px 0 0">' +
+    Object.keys(themes).map(t => '<button class="segb' + (cur === t ? ' on' : '') + '" data-thm="' + t + '">' + themes[t] + '</button>').join('') + '</div></div>';
+  const dotCls = a => (a === 'dynamic' ? ' dyn' : (a === 'custom' ? ' customdot' : ''));
+  const dotStyle = a => (a === 'dynamic') ? '' : (a === 'custom' ? (curCustom ? ' style="background:' + curCustom + '"' : '') : ' style="background:' + accents[a][0] + '"');
+  html += '<div class="card"><div class="ltitle">Accent color</div>' +
+    '<div class="accentrow">' + Object.keys(accents).map(a => '<button class="accentdot' + (curA === a ? ' on' : '') + dotCls(a) + '" data-acc="' + a + '"' + dotStyle(a) + ' aria-label="' + accents[a][1] + '"></button>').join('') + '</div>' +
+    '<div class="lsub" style="margin-top:10px">' + (curA === 'dynamic' ? 'Dynamic — follows your system / wallpaper color' : curA === 'custom' ? 'Custom — pick any color below' : accents[curA][1] + ' accent — applies to buttons, highlights and glows') + '</div>' +
+    (curA === 'custom' ? '<div class="colorrow"><input type="color" id="colorPick" value="' + (curCustom || '#1B6EF3') + '"><input class="fld" id="colorHex" value="' + (curCustom || '#1B6EF3') + '" maxlength="7" spellcheck="false"><button class="btn primary" id="colorApply">Apply</button></div>' : '') + '</div>';
+  html += '<div class="card"><div class="setrow"><div class="lmain"><div class="ltitle">Glow effects</div><div class="lsub">Neon glows on buttons, cards and highlights. Turn off for a flat, battery-friendlier look.</div></div>' +
+    '<button class="switch' + (LS.get('glow', true) ? ' on' : '') + '" id="glowSw" aria-label="glow effects"></button></div></div>';
+  html += '<div class="card"><div class="setrow"><div class="lmain"><div class="ltitle">Navigation glow</div><div class="lsub">Adds an accent-colored glow around the bottom navigation bar and its active tab. Off by default for a cleaner look.</div></div>' +
+    '<button class="switch' + (LS.get('navglow', false) ? ' on' : '') + '" id="navglowSw" aria-label="navigation glow"></button></div></div>';
+  html += '<h2 class="sect">Accessibility</h2>';
+  html += '<div class="card"><div class="setrow"><div class="lmain"><div class="ltitle">Reduce motion</div><div class="lsub">Turns off animations and transitions throughout the app</div></div>' +
+    '<button class="switch' + (LS.get('reduceMotion', false) ? ' on' : '') + '" id="motionSw" aria-label="reduce motion"></button></div></div>';
+  html += '<div class="card"><div class="setrow"><div class="lmain"><div class="ltitle">Show link underlines</div><div class="lsub">Underlines links in READMEs, comments and descriptions</div></div>' +
+    '<button class="switch' + (LS.get('linkUnderline', false) ? ' on' : '') + '" id="underlineSw" aria-label="link underlines"></button></div></div>';
+  html += '<h2 class="sect">App updates</h2>';
+  html += '<div class="card"><div class="setrow"><div class="lmain"><div class="ltitle">Auto-download app updates</div><div class="lsub">When you publish a new Gitly release on GitHub, the update APK is downloaded to your Downloads folder automatically.</div></div>' +
+    '<button class="switch' + (LS.get('autodl', false) ? ' on' : '') + '" id="autodlSw" aria-label="auto download updates"></button></div>' +
+    '<div style="display:flex;gap:10px;align-items:center;padding:12px 0 2px;margin-top:12px;border-top:1px solid var(--divider)">' +
+    '<div class="lmain" style="flex:1"><div class="ltitle">Installed</div><div class="lsub">Version ' + APPV + '</div></div>' +
+    '<div class="lmain" style="flex:1;text-align:right"><div class="ltitle" id="updLatest">Checking…</div><div class="lsub">latest on GitHub</div></div></div>' +
+    '<div id="updInfo"></div></div>';
+  html += '<h2 class="sect">Notifications</h2>';
+  html += '<div class="card"><div class="setrow"><div class="lmain"><div class="ltitle">GitHub activity alerts</div><div class="lsub">System notifications for new issues, pull requests, mentions, reviews, releases and CI results on repos you watch or participate in. Checked in the background roughly every 15 minutes — works even when the app is closed.</div></div>' +
+    '<button class="switch' + (LS.get('notify', true) ? ' on' : '') + '" id="notifSw" aria-label="notifications"></button></div>' +
+    '</div>';
+  html += '<h2 class="sect">Sync across devices</h2>';
+  html += '<div class="card"><p style="margin:0;font-size:13.5px;color:var(--text2);line-height:1.6">Sign in with the same GitHub account on any device and Gitly pulls your data from GitHub. Your pins, theme and preferences are also saved to a private Gist in your account, so a new device picks up where you left off. Your access token stays on this device only — it is never synced.</p>' +
+    '<div class="btncol"><button class="btn primary" data-act="synctoast">Sync now</button><button class="btn ghost" data-act="syncrestore">Restore from GitHub</button></div>' +
+    '<div class="syncstat" id="syncStat">' + (gistId ? 'Linked to a private Gist in your account' : 'No sync Gist yet — one is created on your first sync') + '</div></div>';
+  html += '<h2 class="sect">Pinned repositories</h2>';
+  if (pins.length) {
+    html += '<div class="card list">';
+    pins.forEach(p => {
+      html += '<div class="lrow"><div class="lmain"><div class="ltitle">' + esc(p.full_name) + '</div></div><button class="pinbtn pinned" data-act="unpin" data-full="' + esc(p.full_name) + '" aria-label="unpin">' + SVG.star + '</button></div>';
+    });
+    html += '</div>';
+  } else html += '<div class="card empty">Nothing pinned yet.</div>';
+  html += '<h2 class="sect">Account</h2>';
+  const accs = getAccounts();
+  if (accs.length) {
+    html += '<div class="card list">' + accs.map(a =>
+      '<div class="lrow" data-swacc="' + esc(a.login) + '">' +
+      (a.avatar ? '<img src="' + esc(a.avatar) + '" alt="" style="width:34px;height:34px;border-radius:50%;flex-shrink:0">' : '') +
+      '<div class="lmain"><div class="ltitle">' + esc(a.login) + '</div><div class="lsub">' + (a.token === TOKEN ? 'Currently active' : 'Tap to switch to this account') + '</div></div>' +
+      (a.token === TOKEN ? '<span class="chip ok">Active</span>' : '') + '</div>').join('') + '</div>';
+  }
+  html += '<div style="display:flex;gap:8px"><button class="btn ghost" id="addAccBtn" style="flex:1">Add account</button><button class="btn danger" id="logoutBtn" style="flex:1">Sign out</button></div>';
+  if (seq !== RSEQ) return;
+  view().innerHTML = html;
+  wireTabs();
+  $$('[data-thm]').forEach(b => b.addEventListener('click', () => {
+    LS.set('theme', b.dataset.thm); applyTheme(); queueSync();
+    $$('[data-thm]').forEach(x => x.classList.toggle('on', x === b));
+    toast(themes[b.dataset.thm] + ' theme');
+  }));
+  $$('[data-acc]').forEach(b => b.addEventListener('click', () => {
+    LS.set('accent', b.dataset.acc); applyTheme(); queueSync();
+    $$('[data-acc]').forEach(x => x.classList.toggle('on', x === b));
+    toast(b.dataset.acc === 'dynamic' ? 'Dynamic accent — following your system color' : b.dataset.acc === 'custom' ? 'Custom color — pick your shade below' : accents[b.dataset.acc][1] + ' accent');
+    renderSettings();
+  }));
+  const cp = $('#colorPick'), chx = $('#colorHex'), cap = $('#colorApply');
+  if (cp && chx) {
+    cp.addEventListener('input', () => { chx.value = cp.value.toUpperCase(); });
+    cp.addEventListener('change', () => { LS.set('customAccent', cp.value.toUpperCase()); applyTheme(); queueSync(); toast('Custom color applied'); });
+    const applyHex = () => {
+      let v = (chx.value || '').trim().toUpperCase();
+      if (!v.startsWith('#')) v = '#' + v;
+      if (/^#[0-9A-F]{6}$/.test(v)) { LS.set('customAccent', v); applyTheme(); queueSync(); toast('Custom color applied'); renderSettings(); }
+      else toast('Enter a color like #1B6EF3');
+    };
+    if (cap) cap.addEventListener('click', applyHex);
+    chx.addEventListener('keydown', e => { if (e.key === 'Enter') applyHex(); });
+  }
+  const glowSw = $('#glowSw');
+  if (glowSw) glowSw.addEventListener('click', () => {
+    const on = !glowSw.classList.contains('on');
+    glowSw.classList.toggle('on', on);
+    LS.set('glow', on); applyTheme(); queueSync();
+    toast(on ? 'Glow effects on' : 'Glow effects off');
+  });
+  const nsw = $('#navglowSw');
+  if (nsw) nsw.addEventListener('click', () => {
+    const on = !nsw.classList.contains('on');
+    nsw.classList.toggle('on', on);
+    LS.set('navglow', on); applyTheme(); queueSync();
+    toast(on ? 'Navigation glow on' : 'Navigation glow off');
+  });
+  const msw = $('#motionSw');
+  if (msw) msw.addEventListener('click', () => {
+    const on = !msw.classList.contains('on');
+    msw.classList.toggle('on', on);
+    LS.set('reduceMotion', on); applyA11y(); queueSync();
+    toast(on ? 'Reduced motion — animations off' : 'Animations on');
+  });
+  const usw = $('#underlineSw');
+  if (usw) usw.addEventListener('click', () => {
+    const on = !usw.classList.contains('on');
+    usw.classList.toggle('on', on);
+    LS.set('linkUnderline', on); applyA11y(); queueSync();
+    toast(on ? 'Link underlines shown' : 'Link underlines hidden');
+  });
+  const adw = $('#autodlSw');
+  if (adw) adw.addEventListener('click', () => {
+    const on = !adw.classList.contains('on');
+    adw.classList.toggle('on', on);
+    LS.set('autodl', on); queueSync();
+    toast(on ? 'Auto-download updates on' : 'Auto-download updates off');
+  });
+  const latestEl = $('#updLatest'), infoEl = $('#updInfo');
+  if (latestEl) {
+    latestPublishedRelease().then(rel => {
+      if (!latestEl.isConnected) return;
+      const label = (rel && (rel.name || rel.tag_name)) || 'not found';
+      latestEl.textContent = label;
+      if (!infoEl || !rel || !rel.id) return;
+      // update when the release's tag version is newer than this app's version,
+      // or when the release was published after this install
+      const published = Date.parse(rel.published_at || '') || 0;
+      const tagv = releaseVersion(rel);
+      const versionNewer = !!tagv && newerVersion(tagv, APPV);
+      const dateNewer = !!(published && INSTALLED_AT && published > INSTALLED_AT);
+      const isUpdate = versionNewer || dateNewer;
+      const asset = (rel.assets || []).find(a => /\.apk$/i.test(a.name || ''));
+      infoEl.innerHTML =
+        (isUpdate
+          ? '<div class="lsub" style="padding:10px 0 4px">Update available — ' + esc(label) + '</div>' +
+            (asset ? '<div class="lrow" data-act="download" data-url="' + esc(asset.browser_download_url) + '" data-name="' + esc(asset.name) + '" style="padding:10px 0">' + SVG.dl +
+            '<div class="lmain"><div class="ltitle">' + esc(asset.name) + '</div><div class="lsub">' + fmtSize(asset.size) + ' · tap to download the update</div></div></div>' : '')
+          : '<div class="lsub" style="padding:10px 0 4px">You are on the latest version.</div>') +
+        '<div style="display:flex;gap:8px;margin-top:10px">' +
+        '<button class="btn ghost" id="updLog" style="flex:1">ChangeLog</button>' +
+        (isUpdate ? '<button class="btn ghost" id="updPopup" style="flex:1">Show update popup</button>' : '') +
+        '</div>';
+      const lg = $('#updLog');
+      if (lg) lg.addEventListener('click', () => showChangelogSheet(rel));
+      const pu = $('#updPopup');
+      if (pu) pu.addEventListener('click', () => { showUpdateCard(rel); });
+    }).catch(() => { if (latestEl.isConnected) latestEl.textContent = 'check failed'; });
+  }
+  $('#logoutBtn').addEventListener('click', () => doLogout('Signed out'));
+  $$('[data-swacc]').forEach(r => r.addEventListener('click', () => switchAccount(r.dataset.swacc)));
+  const aab = $('#addAccBtn');
+  if (aab) aab.addEventListener('click', () => { showLogin(); $('#tokenInput').value = ''; });
+  const notifSw = $('#notifSw');
+  if (notifSw) notifSw.addEventListener('click', () => {
+    const on = !notifSw.classList.contains('on');
+    notifSw.classList.toggle('on', on);
+    LS.set('notify', on);
+    try { if (window.OneGit && window.OneGit.setNotifications) window.OneGit.setNotifications(on); } catch (e) {}
+    toast(on ? 'GitHub alerts on — checked every ~15 minutes' : 'GitHub alerts off');
+  });
+}
+
+/* ================= actions ================= */
+const ACTIONS = {
+  ext: el => { try { window.location.href = el.dataset.url; } catch (e) {} },
+  discover: () => { RS.mode = 'discover'; location.hash = '#/repos'; },
+  clone: el => cloneSheet(el.dataset.full),
+  copy: el => {
+    const t = el.dataset.copy;
+    try { if (window.OneGit && window.OneGit.copy) { window.OneGit.copy(t); toast('Copied to clipboard'); return; } } catch (e) {}
+    try { navigator.clipboard.writeText(t); toast('Copied to clipboard'); } catch (e) { toast('Copy not available here'); }
+  },
+  download: el => {
+    toast('Downloading ' + el.dataset.name);
+    try { if (window.OneGit && window.OneGit.download) { window.OneGit.download(el.dataset.url, el.dataset.name); return; } } catch (e) {}
+    try { window.location.href = el.dataset.url; } catch (e) {}
+  },
+  /* repo-file attachment download that routes through api.github.com,
+     so it works even where raw.githubusercontent.com is unreachable */
+  apidl: (el, e) => {
+    toast('Downloading ' + el.dataset.name);
+    try {
+      if (window.OneGit && window.OneGit.apiDownload) { window.OneGit.apiDownload(el.dataset.owner, el.dataset.repo, el.dataset.path, el.dataset.name); return; }
+    } catch (err) {}
+    if (e) e.preventDefault ? e.preventDefault() : null;
+    try { window.location.href = 'https://raw.githubusercontent.com/' + el.dataset.owner + '/' + el.dataset.repo + '/HEAD/' + el.dataset.path; } catch (err) {}
+  },
+  deployments: el => deploymentsSheet(el.dataset.full),
+  openfile: async el => {
+    const full = el.dataset.repo, path = el.dataset.file;
+    openSheet('<div class="sheethead"><b>' + esc(path.split('/').pop()) + '</b><button class="iconbtn" data-act="closesheet">' + SVG.x + '</button></div>' + spinner(true));
+    try {
+      const meta = await api('/repos/' + full + '/contents/' + (path ? encodeURIComponent(path).replace(/%2F/g, '/') : ''));
+      let raw = '';
+      if (meta && typeof meta.content === 'string' && meta.encoding === 'base64') {
+        const b64 = meta.content.replace(/\n/g, '');
+        try { raw = decodeURIComponent(escape(atob(b64))); } catch (e2) { raw = atob(b64); }
+      }
+      const card = $('.sheetcard');
+      if (card) {
+        const MAX = 60000;
+        let shown = raw, cut = false;
+        if (raw.length > MAX) { shown = raw.slice(0, MAX); cut = true; }
+        const lines = shown.split('\n');
+        if (lines.length > 2000) { shown = lines.slice(0, 2000).join('\n'); cut = true; }
+        card.innerHTML = '<div class="sheethead"><b>' + esc(path) + '</b><button class="iconbtn" data-act="closesheet">' + SVG.x + '</button></div>' +
+          '<pre class="filepre">' + esc(shown || '(empty file)') + (cut ? '\n\n… — this file is large, showing the first ' + nf(Math.min(raw.length, MAX)) + ' characters.' : '') + '</pre>';
+        {
+          const parts = full.split('/');
+          const fname = path.split('/').pop() || 'file';
+          const canEdit = await canPushRepo(parts[0], parts[1]);
+          /* Download is offered for every file - including binaries the viewer
+             cannot show (a .ttf, a .keystore, anything over 1MB) */
+          let acts = '<div style="display:flex;gap:8px;margin-top:12px">' +
+            '<button class="btn ghost" data-act="apidl" data-owner="' + esc(parts[0]) + '" data-repo="' + esc(parts[1]) + '" data-path="' + esc(path) + '" data-name="' + esc(fname) + '" style="flex:1;display:flex;align-items:center;justify-content:center;gap:8px">' + SVG.dl + '<span>Download</span></button>';
+          if (canEdit && raw) {
+            acts += '<button class="btn ghost" id="editFileBtn" style="flex:1">Edit</button>' +
+              '<button class="btn danger" id="delFileBtn" style="flex:1">Delete</button>';
+          }
+          acts += '</div>';
+          card.innerHTML += acts;
+          if (canEdit && raw) {
+            $('#editFileBtn').addEventListener('click', () => editFileSheet(full, path, raw, meta.sha));
+            $('#delFileBtn').addEventListener('click', () => deleteFileSheet(full, path, meta.sha));
+          }
+        }
+      }
+    } catch (e) { closeSheet(); toast('Cannot open this file'); }
+  },
+  relup: el => {
+    const rid = el.dataset.relup, rf = el.dataset.full;
+    if (window.OneGit && window.OneGit.pickAssets && rf) {
+      try { toast('Choose files to attach'); window._assetAfter = () => route(); window.OneGit.pickAssets(rf, rid); return; } catch (e) {}
+    }
+    window._relTarget = rid; const inp = $('#relUpInput'); if (inp) inp.click();
+  },
+  delasset: el => { deleteAssetSheet(el.dataset.full, el.dataset.aid, el.dataset.aname); },
+  renasset: el => { renameAssetSheet(el.dataset.full, el.dataset.aid, el.dataset.aname); },
+  closesheet: () => closeSheet(),
+  synctoast: () => syncPush(false),
+  syncrestore: () => syncRestore(false),
+  unpin: el => { pins = pins.filter(p => p.full_name !== el.dataset.full); LS.set('pins', pins); queueSync(); toast('Unpinned'); renderSettings(); },
+  opennotif: async el => {
+    const id = el.dataset.id, url = el.dataset.url;
+    try { await api('/notifications/threads/' + id, { method: 'PATCH' }); } catch (e) {}
+    try {
+      const s = await api(url.replace('https://api.github.com', ''));
+      if (s && s.number && s.repository) { location.hash = '#/issue/' + s.repository.full_name + '/' + s.number; return; }
+      if (s && s.html_url) { window.location.href = s.html_url; return; }
+    } catch (e) {}
+    el.classList.remove('unread'); toast('Marked as read');
+  }
+};
+
+/* ================= global events ================= */
+document.addEventListener('click', e => {
+  const pin = e.target.closest('[data-pinbtn]');
+  if (pin) { const r = repoCache.get(pin.dataset.pinbtn); if (r) togglePin(r); return; }
+  const act = e.target.closest('[data-act]');
+  if (act && ACTIONS[act.dataset.act]) { e.preventDefault(); ACTIONS[act.dataset.act](act, e); return; }
+  const go = e.target.closest('[data-go]');
+  if (go) { location.hash = go.dataset.go; return; }
+  /* collapsible README panels animate open/closed instead of popping */
+  const sm = e.target.closest('summary');
+  if (sm && sm.parentElement && sm.parentElement.tagName === 'DETAILS') {
+    const d = sm.parentElement;
+    e.preventDefault();
+    const opening = !d.open;
+    const h0 = d.offsetHeight;
+    let h1;
+    if (opening) { d.open = true; h1 = d.offsetHeight; } else { h1 = sm.offsetHeight; }
+    d.style.overflow = 'hidden';
+    d.style.transition = 'none';
+    d.style.height = h0 + 'px';
+    requestAnimationFrame(() => {
+      d.style.transition = 'height .26s cubic-bezier(.4,0,.2,1)';
+      d.style.height = h1 + 'px';
+      setTimeout(() => {
+        if (!opening) d.open = false;
+        d.style.removeProperty('height'); d.style.removeProperty('overflow'); d.style.removeProperty('transition');
+      }, 280);
+    });
+    return;
+  }
+  /* links inside rendered GitHub content */
+  const a = e.target.closest('a[href]');
+  if (a) {
+    const href = a.getAttribute('href') || '';
+    /* in-page anchors from GitHub content only (app routes use #/…) */
+    if (href.charAt(0) === '#' && href.charAt(1) !== '/') {
+      /* in-page anchor - scroll to the heading, never touch the route */
+      e.preventDefault();
+      const id = href.slice(1).replace(/[^\w-]/g, '');
+      const scope = a.closest('.md, .sheetcard') || document;
+      const t = id && (scope.querySelector('a[name="' + id + '"]') || scope.querySelector('[id="' + id + '"]') || scope.querySelector('[id="user-content-' + id + '"]'));
+      if (t) t.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      return;
+    }
+    const m = href.match(/^https:\/\/github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/?$/);
+    if (m) {
+      /* repo / profile links open inside the app */
+      e.preventDefault();
+      location.hash = '#/repo/' + m[1] + '/' + m[2];
+      return;
+    }
+    /* anything else falls through and the WebViewClient opens it in the browser */
+  }
+});
+$('#sheet').addEventListener('click', e => { if (e.target.id === 'sheet') closeSheet(); });
+/* keyboard + window handling for desktop and laptop use */
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') {
+    const s = $('#sheet');
+    if (s && !s.hidden) { closeSheet(); return; }
+  }
+});
+window.addEventListener('resize', () => { if (isWide()) navShow(); });
+/* ---- bottom nav auto-hide: hides on scroll-down and after idle, returns on any touch or scroll-up ---- */
+let lastY = 0, idleT = null;
+/* on a laptop the navigation is a permanent rail, so the auto-hide behaviour
+   is limited to the phone layout */
+function isWide() { try { return window.innerWidth >= 1080; } catch (e) { return false; } }
+function navShow() { const nb = $('#navbar'); if (nb) nb.classList.remove('hide'); resetIdle(); }
+function navHide() { if (isWide()) return; const nb = $('#navbar'); if (nb) nb.classList.add('hide'); clearTimeout(idleT); }
+function resetIdle() {
+  clearTimeout(idleT);
+  idleT = setTimeout(() => { if (isWide()) return; const sc = $('#scroller'); if (sc && sc.scrollTop > 150) navHide(); }, 4000);
+}
+$('#scroller').addEventListener('scroll', () => {
+  const sc = $('#scroller'); const y = sc.scrollTop;
+  $('#appbar').classList.toggle('on', y > 110);
+  if (!isWide()) {
+    if (y > lastY + 10 && y > 80) navHide();
+    else if (y < lastY - 10) navShow();
+  }
+  lastY = y;
+  resetIdle();
+});
+document.addEventListener('pointerdown', () => navShow(), true);
+window.addEventListener('keydown', () => navShow());
+$('#backBig').addEventListener('click', () => history.back());
+$('#backApp').addEventListener('click', () => history.back());
+const doRefresh = () => { view().innerHTML = spinner(); route(); };
+$('#refreshBig').addEventListener('click', doRefresh);
+$('#refreshApp').addEventListener('click', doRefresh);
+/* shared by token login and OAuth: validates the token, stores it, restores sync */
+async function completeLogin(tok) {
+  const old = TOKEN; TOKEN = tok;
+  try {
+    USER = await api('/user');
+    const rec = addAccount(USER.login, tok, USER.avatar_url || '');
+    gistId = rec.gistId || null; LS.set('gistId', gistId);
+    LS.set('token', tok);
+    try { if (window.OneGit && window.OneGit.saveToken) window.OneGit.saveToken(tok); } catch (e) {}
+    try { if (window.OneGit && window.OneGit.setNotifications) window.OneGit.setNotifications(LS.get('notify', true)); } catch (e) {}
+    const restored = await syncRestore(true);
+    saveGistToAccount();
+    if (location.hash === '#/home' || location.hash === '') route();
+    else location.hash = '#/home';
+    widgetPush();
+    toast(restored ? 'Welcome back — data restored from GitHub' : 'Welcome, ' + USER.login);
+  } catch (e) {
+    TOKEN = old; USER = null;
+    throw e;
+  }
+}
+$('#loginBtn').addEventListener('click', async () => {
+  const tok = $('#tokenInput').value.trim();
+  if (!tok) { toast('Paste your GitHub token first'); return; }
+  const btn = $('#loginBtn');
+  btn.disabled = true; btn.textContent = 'Signing in…'; $('#loginErr').textContent = '';
+  try {
+    await completeLogin(tok);
+  } catch (e) {
+    $('#loginErr').textContent = (e.message || 'Sign-in failed') + ' — check the token and its scopes.';
+    toast('Sign-in failed');
+  }
+  btn.disabled = false; btn.textContent = 'Sign in';
+});
+
+/* The device flow needs the native bridge (GitHub's OAuth endpoints send no
+   CORS headers, so the page cannot call them itself). On the published website
+   we hide that button and leave the personal-access-token sign-in, which works
+   from a plain browser. */
+try {
+  if (!(window.OneGit && window.OneGit.oauthStart)) {
+    const gb = document.getElementById('ghLoginBtn');
+    if (gb) gb.hidden = true;
+    const dv = document.getElementById('loginDivider');
+    if (dv) dv.hidden = true;
+  }
+} catch (e) {}
+
+/* ================= GitHub OAuth sign-in (device flow, no secret needed) ================= */
+const OAUTH_SCOPES = 'repo read:user notifications gist';
+let oauthTimer = null, oauthBusy = false;
+function oauthPending() {
+  const p = LS.get('oauth.pending', null);
+  return (p && p.device_code && Date.now() < p.expires) ? p : null;
+}
+window.__oauthStart = (ok, resp) => {
+  const btn = $('#ghLoginBtn');
+  if (btn) btn.disabled = false;
+  if (!ok) { toast('Could not start sign-in: ' + resp); return; }
+  let j = {};
+  try { j = JSON.parse(resp) || {}; } catch (e) {}
+  if (!j.device_code || !j.user_code) { toast('Could not start sign-in' + (j.error_description ? ' — ' + j.error_description : '')); return; }
+  LS.set('oauth.pending', { device_code: j.device_code, user_code: j.user_code, interval: j.interval || 5, expires: Date.now() + (j.expires_in || 900) * 1000 });
+  try { if (window.OneGit && OneGit.copy) OneGit.copy(j.user_code); } catch (e) {}
+  clearTimeout(oauthTimer);
+  showDeviceSheet();
+  scheduleOauthPoll();
+};
+window.__oauthPoll = (ok, resp) => {
+  oauthBusy = false;
+  const p = oauthPending();
+  if (!p) return;
+  let j = {};
+  try { j = JSON.parse(resp) || {}; } catch (e) {}
+  if (ok && j.access_token) {
+    LS.del('oauth.pending');
+    clearTimeout(oauthTimer);
+    closeSheet();
+    toast('Signed in with GitHub');
+    completeLogin(j.access_token).catch(e => { toast('Sign-in failed: ' + e.message); });
+    return;
+  }
+  const err = j.error || '';
+  if (err === 'authorization_pending') { scheduleOauthPoll(); return; }
+  if (err === 'slow_down') { p.interval = (p.interval || 5) + 5; LS.set('oauth.pending', p); scheduleOauthPoll(); return; }
+  if (err === 'expired_token') { LS.del('oauth.pending'); clearTimeout(oauthTimer); toast('Sign-in code expired — start again'); return; }
+  if (err === 'access_denied') { LS.del('oauth.pending'); clearTimeout(oauthTimer); toast('Sign-in was denied on GitHub'); return; }
+  scheduleOauthPoll();
+};
+function oauthPollNow() {
+  const p = oauthPending();
+  if (!p) { clearTimeout(oauthTimer); return; }
+  if (oauthBusy) return;
+  if (!window.OneGit || !OneGit.oauthPoll) { toast('Not available in this build'); return; }
+  oauthBusy = true;
+  try { OneGit.oauthPoll(p.device_code); } catch (e) { oauthBusy = false; }
+}
+function scheduleOauthPoll() {
+  clearTimeout(oauthTimer);
+  const p = oauthPending();
+  if (!p) return;
+  oauthTimer = setTimeout(oauthPollNow, Math.max(3, p.interval || 5) * 1000);
+}
+function showDeviceSheet() {
+  const p = oauthPending();
+  if (!p) return;
+  const mins = Math.max(1, Math.round((p.expires - Date.now()) / 60000));
+  openSheet('<div class="sheethead"><b>Sign in with GitHub</b><button class="iconbtn" data-act="closesheet">' + SVG.x + '</button></div>' +
+    '<div class="card" style="text-align:center;padding:22px 16px">' +
+    '<div class="lsub">Enter this code at</div>' +
+    '<div class="ltitle" style="margin:2px 0 12px">github.com/login/device</div>' +
+    '<div style="font-size:34px;font-weight:800;letter-spacing:4px">' + esc(p.user_code) + '</div>' +
+    '<div class="lsub" style="margin-top:10px">Copied to your clipboard</div></div>' +
+    '<button class="btn primary btnblock" data-act="ext" data-url="https://github.com/login/device" style="margin-top:4px">Open github.com/login/device</button>' +
+    '<button class="btn ghost btnblock" id="oauthContinue" style="margin-top:8px">Continue — I approved on GitHub</button>' +
+    '<div class="lsub" style="margin-top:12px;text-align:center">GitHub does not redirect back — approve there, then return. The code expires in ' + mins + ' minutes; sign-in finishes automatically even if you close this.</div>');
+  const oc = $('#oauthContinue');
+  if (oc) oc.addEventListener('click', () => { oauthPollNow(); toast('Checking GitHub…'); });
+}
+function startDeviceLogin() {
+  if (!window.OneGit || !OneGit.oauthStart) { toast('Not available in this build'); return; }
+  const btn = $('#ghLoginBtn');
+  if (btn) { btn.disabled = true; }
+  try { OneGit.oauthStart(OAUTH_SCOPES); } catch (e) { if (btn) btn.disabled = false; }
+}
+$('#ghLoginBtn').addEventListener('click', startDeviceLogin);
+$('#tokenInput').addEventListener('keydown', e => { if (e.key === 'Enter') $('#loginBtn').click(); });
+window.addEventListener('hashchange', route);
+window.addEventListener('resize', fitBigTitle);
+
+/* ================= profile README (special repo) ================= */
+function specialRepoGo(login) {
+  return LS.get('spr:' + login, false) ? '#/profile/' + login : '#/user/' + login;
+}
+function checkSpecialRepo(login) {
+  api('/repos/' + login + '/' + login, { status: true }).then(r => {
+    const has = !!(r && r.ok && r.data);
+    if (LS.get('spr:' + login, false) !== has) {
+      LS.set('spr:' + login, has);
+      const card = view() && view().querySelector('.card.profile');
+      if (card) card.dataset.go = has ? '#/profile/' + login : '#/user/' + login;
+    }
+  }).catch(() => {});
+}
+
+/* ================= github.com deep links ================= */
+window.openGithubUrl = function (raw) {
+  let u;
+  try { u = new URL(String(raw)); } catch (e) { return false; }
+  const host = (u.hostname || '').toLowerCase();
+  const land = () => { try { toast('Opened in Gitly'); } catch (e) {} };
+  if (host === 'gist.github.com') {
+    const m = (u.pathname || '').match(/^\/(?:[^\/]+\/)?([0-9a-f]{6,})/i);
+    if (m) { location.hash = '#/gist/' + m[1]; land(); return true; }
+    return false;
+  }
+  if (host !== 'github.com' && host !== 'www.github.com' && host !== 'm.github.com') return false;
+  const seg = (u.pathname || '').split('/').filter(Boolean);
+  if (!seg.length) { location.hash = '#/home'; land(); return true; }
+  const noScreen = { notifications: 1, settings: 1, login: 1, join: 1, orgs: 1, topics: 1, explore: 1, marketplace: 1, new: 1, trending: 1, collections: 1, events: 1, pricing: 1, security: 1, features: 1, enterprise: 1, about: 1, pulls: 1, dashboard: 1, apps: 1, sponsors: 1, mobile: 1, feed: 1, site: 1 };
+  if (noScreen[String(seg[0]).toLowerCase()] && seg.length === 1) return false;
+  if (seg.length === 1) { location.hash = '#/user/' + seg[0]; land(); return true; }
+  const full = seg[0] + '/' + seg[1];
+  const rest = seg.slice(2);
+  if (!rest.length) { location.hash = '#/repo/' + full; land(); return true; }
+  const k = String(rest[0]).toLowerCase();
+  if (k === 'commit' && rest[1]) { location.hash = '#/commit/' + full + '/' + rest[1]; land(); return true; }
+  if (k === 'commits') { location.hash = '#/repo/' + full + '/commits'; land(); return true; }
+  if (k === 'releases' || k === 'tags') { location.hash = '#/repo/' + full + '/releases'; land(); return true; }
+  if ((k === 'issues' || k === 'pull') && /^\d+$/.test(rest[1] || '')) { location.hash = '#/issue/' + full + '/' + rest[1]; land(); return true; }
+  if (k === 'issues') { location.hash = '#/repo/' + full + '/issues'; land(); return true; }
+  if (k === 'pulls') { location.hash = '#/issues'; land(); return true; }
+  if (k === 'tree' || k === 'blob') {
+    let parts = rest.slice(2);
+    if (k === 'blob' && parts.length) parts = parts.slice(0, -1); // blob points at a file - open its folder
+    const p = parts.join('/');
+    location.hash = '#/repo/' + full + '/files' + (p ? '/' + p : '');
+    land();
+    return true;
+  }
+  location.hash = '#/repo/' + full; land(); return true;
+};
+
+/* ================= boot ================= */
+applyTheme();
+applyFont();
+saveTokenNative();
+route();
+if (TOKEN) syncRestore(true).then(ok => { if (ok && (location.hash === '#/home' || location.hash === '')) route(); }).catch(() => {});
+
+/* ================= v2.78: pull requests, actions, security, insights, deployments,
+   pages, environments, interaction limits, branch protection, SSH/GPG keys,
+   organizations and accessibility settings ================= */
+
+/* Hand the numbers the app already has to the home screen widgets. They are
+   stored on the device, so the widget shows them straight away and keeps them
+   after the app is closed - no background fetch required. */
+let NT_UNREAD = -1;
+function widgetPush() {
+  try {
+    if (!window.OneGit || !OneGit.widgetSync) return;
+    const p = { login: (USER && USER.login) ? USER.login : '' };
+    try {
+      const a = getComputedStyle(document.documentElement).getPropertyValue('--accent').trim();
+      if (/^#[0-9A-Fa-f]{6}$/.test(a)) p.accent = a.toUpperCase();
+    } catch (e) {}
+    const cc = LS.get('c.prod', null);
+    if (cc && cc.contributionCalendar) {
+      const days = [];
+      cc.contributionCalendar.weeks.forEach(w => w.contributionDays.forEach(d => days.push(d)));
+      const today = todayStr();
+      let cur = 0, i = days.length - 1;
+      while (i >= 0 && days[i].contributionCount === 0) i--;
+      while (i >= 0 && days[i].contributionCount > 0) { cur++; i--; }
+      const td = days.filter(d => d.date === today)[0];
+      p.today = td ? td.contributionCount : 0;
+      p.streak = cur;
+      p.total = cc.contributionCalendar.totalContributions || 0;
+    }
+    if (NT_UNREAD >= 0) p.unread = NT_UNREAD;
+    if (!p.login && !cc && NT_UNREAD < 0) return;
+    OneGit.widgetSync(JSON.stringify(p));
+  } catch (e) {}
+}
+function applyA11y() {
+  document.body.classList.toggle('reducemotion', !!LS.get('reduceMotion', false));
+  document.body.classList.toggle('showunderline', !!LS.get('linkUnderline', false));
+}
+
+/* ---------- pull requests ---------- */
+let PRS = { state: 'open' };
+async function renderPulls(o, n) {
+  const seq = ++RSEQ;
+  const full = o + '/' + n;
+  const canPush = await canPushRepo(o, n).catch(() => false);
+  if (seq !== RSEQ) return;
+  view().innerHTML = (canPush ? '<button class="btn ghost btnblock" id="newPrBtn" style="margin-bottom:12px">New pull request</button>' : '') +
+    '<div class="seg sm" style="margin-bottom:12px"><button class="segb' + (PRS.state === 'open' ? ' on' : '') + '" data-prs="open">Open</button>' +
+    '<button class="segb' + (PRS.state === 'closed' ? ' on' : '') + '" data-prs="closed">Closed</button>' +
+    '<button class="segb' + (PRS.state === 'all' ? ' on' : '') + '" data-prs="all">All</button></div>' +
+    '<div id="prList">' + spinner() + '</div>';
+  const nb = $('#newPrBtn'); if (nb) nb.addEventListener('click', () => newPullSheet(o, n));
+  $$('[data-prs]').forEach(b => b.addEventListener('click', () => { PRS.state = b.dataset.prs; renderPulls(o, n); }));
+  let prs;
+  try { prs = await api('/repos/' + full + '/pulls?state=' + PRS.state + '&sort=updated&direction=desc&per_page=30'); }
+  catch (e) { if (seq === RSEQ) { const l = $('#prList'); if (l) l.innerHTML = errCard(e); } return; }
+  if (seq !== RSEQ) return;
+  let html = '';
+  if (!prs.length) html = '<div class="card empty">No ' + (PRS.state === 'all' ? '' : PRS.state + ' ') + 'pull requests here.</div>';
+  else {
+    html = '<div class="card list">';
+    prs.forEach(p => {
+      const merged = !!p.merged_at;
+      html += '<div class="lrow" data-go="#/issue/' + full + '/' + p.number + '">' +
+        '<div class="istate' + (merged ? ' merged' : (p.state === 'open' ? '' : ' closed')) + '">' + (merged ? SVG.check : (p.state === 'open' ? SVG.dot : SVG.x)) + '</div>' +
+        '<div class="lmain"><div class="ltitle">' + esc(p.title) + (p.draft ? ' <span class="chip">Draft</span>' : '') + (merged ? ' <span class="chip ok">Merged</span>' : '') + '</div>' +
+        '<div class="lsub">#' + p.number + ' · ' + esc(p.user.login) + ' · ' + esc(p.head.ref) + ' → ' + esc(p.base.ref) + ' · ' + tAgo(p.updated_at) + ' · ' + (p.comments || 0) + ' comments</div></div></div>';
+    });
+    html += '</div>';
+  }
+  const pl = $('#prList'); if (pl) pl.innerHTML = html;
+}
+function newPullSheet(o, n) {
+  const full = o + '/' + n;
+  openSheet('<div class="sheethead"><b>New pull request</b><button class="iconbtn" data-act="closesheet">' + SVG.x + '</button></div>' +
+    '<div id="prForm">' + spinner(true) + '</div>');
+  api('/repos/' + full).then(async r => {
+    const branches = await api('/repos/' + full + '/branches?per_page=100').catch(() => []);
+    const f = $('#prForm'); if (!f) return;
+    f.innerHTML = '<label class="fldlabel">Base branch</label><select class="fld" id="prBase">' +
+      branches.map(b => '<option value="' + esc(b.name) + '"' + (b.name === r.default_branch ? ' selected' : '') + '>' + esc(b.name) + '</option>').join('') + '</select>' +
+      '<label class="fldlabel" style="margin-top:12px">Compare branch (your changes)</label><select class="fld" id="prHead">' +
+      branches.map(b => '<option value="' + esc(b.name) + '"' + (b.name !== r.default_branch ? ' selected' : '') + '>' + esc(b.name) + '</option>').join('') + '</select>' +
+      '<label class="fldlabel" style="margin-top:12px">Title</label><input class="fld" id="prTitle" autocomplete="off">' +
+      '<label class="fldlabel" style="margin-top:12px">Description</label><textarea class="fld" id="prBody" rows="4"></textarea>' +
+      '<button class="btn primary btnblock" id="prGo" style="margin-top:16px">Create pull request</button>';
+    $('#prGo').addEventListener('click', async () => {
+      const title = $('#prTitle').value.trim();
+      if (!title) { toast('Add a title first'); return; }
+      $('#prGo').disabled = true;
+      try {
+        const pr = await api('/repos/' + full + '/pulls', { method: 'POST', body: JSON.stringify({ title: title, body: $('#prBody').value, head: $('#prHead').value, base: $('#prBase').value }) });
+        closeSheet(); toast('Pull request #' + pr.number + ' created');
+        location.hash = '#/issue/' + full + '/' + pr.number;
+      } catch (e) { toast('Failed: ' + e.message); $('#prGo').disabled = false; }
+    });
+  }).catch(e => { const f = $('#prForm'); if (f) f.innerHTML = errCard(e); });
+}
+function mergeSheet(o, n, num, pr) {
+  const full = o + '/' + n;
+  let method = 'merge';
+  openSheet('<div class="sheethead"><b>Merge pull request #' + num + '</b><button class="iconbtn" data-act="closesheet">' + SVG.x + '</button></div>' +
+    '<div class="lsub">' + esc(pr.head.ref) + ' → ' + esc(pr.base.ref) +
+    (pr.mergeable === false ? ' · GitHub reports this branch has conflicts that must be resolved first' : '') + '</div>' +
+    '<div class="seg sm" style="margin-top:14px"><button class="segb on" data-mm="merge">Merge</button>' +
+    '<button class="segb" data-mm="squash">Squash</button><button class="segb" data-mm="rebase">Rebase</button></div>' +
+    '<div class="lsub" style="margin-top:10px">Pick how the commits land in ' + esc(pr.base.ref) + '.</div>' +
+    '<button class="btn primary btnblock" id="mgGo" style="margin-top:16px">Merge now</button>');
+  $$('[data-mm]').forEach(b => b.addEventListener('click', () => { method = b.dataset.mm; $$('[data-mm]').forEach(x => x.classList.toggle('on', x === b)); }));
+  $('#mgGo').addEventListener('click', async () => {
+    $('#mgGo').disabled = true;
+    try {
+      await api('/repos/' + full + '/pulls/' + num + '/merge', { method: 'PUT', body: JSON.stringify({ merge_method: method }) });
+      closeSheet(); toast('Merged pull request #' + num); renderIssue(o, n, num);
+    } catch (e) { toast('Failed: ' + e.message); $('#mgGo').disabled = false; }
+  });
+}
+
+/* ---------- actions ---------- */
+function runIcon(conclusion, status) {
+  let cls = 'mute', svg = SVG.dot;
+  if (status === 'queued' || status === 'in_progress' || status === 'waiting' || status === 'pending') { cls = 'run'; svg = SVG.dot; }
+  else if (conclusion === 'success') { cls = 'ok'; svg = SVG.check; }
+  else if (conclusion === 'failure' || conclusion === 'timed_out' || conclusion === 'startup_failure') { cls = 'bad'; svg = SVG.x; }
+  else if (conclusion === 'cancelled' || conclusion === 'skipped' || conclusion === 'neutral') { cls = 'mute'; svg = SVG.x; }
+  return '<div class="runstate ' + cls + '">' + svg + '</div>';
+}
+function runDur(r) {
+  const end = r.updated_at ? new Date(r.updated_at) : null, st = new Date(r.run_started_at || r.created_at);
+  if (!end || end <= st) return '';
+  let s = Math.round((end - st) / 1000);
+  return s >= 3600 ? Math.floor(s / 3600) + 'h ' + Math.floor((s % 3600) / 60) + 'm' : s >= 60 ? Math.floor(s / 60) + 'm ' + (s % 60) + 's' : s + 's';
+}
+async function renderActions(o, n) {
+  const seq = ++RSEQ;
+  const full = o + '/' + n;
+  view().innerHTML = '<div id="runList">' + spinner() + '</div>';
+  let runs;
+  try { runs = ((await api('/repos/' + full + '/actions/runs?per_page=30')) || {}).workflow_runs || []; }
+  catch (e) { if (seq === RSEQ) view().innerHTML = errCard(e); return; }
+  if (seq !== RSEQ) return;
+  let html;
+  if (!runs.length) html = '<div class="card empty">No workflow runs yet.<div class="lsub" style="margin-top:8px">Actions run automatically on push and other events once the repository has workflow files in .github/workflows.</div></div>';
+  else {
+    html = '<div class="card list">' + runs.map(r =>
+      '<div class="lrow" data-go="#/actionrun/' + full + '/' + r.id + '">' + runIcon(r.conclusion, r.status) +
+      '<div class="lmain"><div class="ltitle">' + esc(r.name || 'Workflow run') + '</div>' +
+      '<div class="lsub">#' + r.run_number + ' · ' + esc(r.head_branch || '-') + ' · ' + esc(r.event) +
+      (runDur(r) ? ' · ' + runDur(r) : '') + ' · ' + tAgo(r.created_at) + '</div></div></div>').join('') + '</div>';
+  }
+  const rl = $('#runList'); if (rl) rl.innerHTML = html;
+}
+async function renderRun(o, n, id) {
+  const seq = ++RSEQ;
+  const full = o + '/' + n;
+  view().innerHTML = spinner();
+  let run, jobs;
+  try {
+    run = await api('/repos/' + full + '/actions/runs/' + id);
+    jobs = ((await api('/repos/' + full + '/actions/runs/' + id + '/jobs?per_page=30')) || {}).jobs || [];
+  } catch (e) { if (seq === RSEQ) view().innerHTML = errCard(e); return; }
+  if (seq !== RSEQ) return;
+  const active = run.status === 'queued' || run.status === 'in_progress' || run.status === 'waiting';
+  let html = '<div class="card"><div class="rcrow"><div class="rcname">' + esc(run.name || 'Workflow run') + '</div>' + runIcon(run.conclusion, run.status) + '</div>' +
+    '<div class="rcmeta">run #' + run.run_number + ' · ' + esc(run.event) + ' · branch ' + esc(run.head_branch || '-') +
+    ' · commit ' + (run.head_sha ? run.head_sha.slice(0, 7) : '') + '</div>' +
+    '<div class="lsub" style="margin-top:6px">Started ' + tAgo(run.run_started_at || run.created_at) + ' by ' + esc(run.actor ? run.actor.login : 'unknown') +
+    ' · ' + esc(active ? run.status : (run.conclusion || run.status)) + (runDur(run) ? ' · took ' + runDur(run) : '') + '</div>' +
+    '<div class="actionrow" style="margin-top:14px">' +
+    (active ? '<button class="btn danger" id="runCancel">Cancel run</button>' : '<button class="btn ghost" id="runRerun">Re-run</button>') +
+    '<button class="btn ghost" data-act="ext" data-url="' + esc(run.html_url) + '">' + SVG.ext + '<span>Open on GitHub</span></button></div></div>';
+  html += '<h2 class="sect">Jobs</h2>';
+  if (!jobs.length) html += '<div class="card empty">No job details for this run.</div>';
+  else {
+    html += '<div class="card list">' + jobs.map(j =>
+      '<div class="lrow" style="flex-wrap:wrap">' + runIcon(j.conclusion, j.status) +
+      '<div class="lmain" style="flex:1"><div class="ltitle">' + esc(j.name) + '</div>' +
+      '<div class="lsub">' + esc(j.status) + (j.conclusion ? ' · ' + esc(j.conclusion) : '') + (j.runner_name ? ' · ' + esc(j.runner_name) : '') + '</div>' +
+      ((j.steps || []).length ? '<div class="steps">' + j.steps.map(s =>
+        '<div class="step">' + (s.conclusion === 'success' ? '<span style="color:#12B76A">✓</span>' : (s.conclusion === 'failure' ? '<span style="color:#EF4444">✗</span>' : '<span>•</span>')) + esc(s.name) + '</div>').join('') + '</div>' : '') +
+      '</div></div>').join('') + '</div>';
+  }
+  view().innerHTML = html;
+  const cc = $('#runCancel');
+  if (cc) cc.addEventListener('click', async () => {
+    cc.disabled = true;
+    try { await api('/repos/' + full + '/actions/runs/' + id + '/cancel', { method: 'POST' }); toast('Cancelling run…'); renderRun(o, n, id); }
+    catch (e) { toast('Failed: ' + e.message); cc.disabled = false; }
+  });
+  const rr = $('#runRerun');
+  if (rr) rr.addEventListener('click', async () => {
+    rr.disabled = true;
+    try { await api('/repos/' + full + '/actions/runs/' + id + '/rerun', { method: 'POST' }); toast('Re-running…'); setTimeout(() => renderRun(o, n, id), 1500); }
+    catch (e) { toast('Failed: ' + e.message); rr.disabled = false; }
+  });
+}
+
+/* ---------- security and quality ---------- */
+async function renderSecurity(o, n) {
+  const seq = ++RSEQ;
+  const full = o + '/' + n;
+  view().innerHTML = spinner();
+  const canAdmin = await canPushRepo(o, n).catch(() => false);
+  const [dep, depFix, secret, alerts] = await Promise.all([
+    api('/repos/' + full + '/vulnerability-alerts', { status: true }).catch(() => null),
+    api('/repos/' + full + '/automated-security-fixes', { status: true }).catch(() => null),
+    api('/repos/' + full + '/secret-scanning').catch(() => null),
+    api('/repos/' + full + '/dependabot/alerts?per_page=20&state=open').catch(() => null)
+  ]);
+  if (seq !== RSEQ) return;
+  const depOn = !!(dep && dep.status === 204);
+  const fixOn = !!(depFix && depFix.status === 204);
+  let html = '<div class="card"><div class="ltitle" style="padding:2px 4px 4px;font-size:15px">Dependabot alerts</div>' +
+    '<div class="setrow"><div class="lmain"><div class="ltitle">Alerts for vulnerable dependencies</div>' +
+    '<div class="lsub">Get notified when one of your dependencies has a known vulnerability</div></div>' +
+    '<button class="switch' + (depOn ? ' on' : '') + '" id="secDepSw" aria-label="dependabot alerts"></button></div>' +
+    (depOn && Array.isArray(alerts) && alerts.length ?
+      '<div style="margin-top:12px">' + alerts.map(a =>
+        '<div class="lrow" style="padding:10px 0" data-act="ext" data-url="' + esc(a.html_url) + '">' +
+        '<div class="lmain"><div class="ltitle">' + esc((a.security_vulnerability && a.security_vulnerability.package && a.security_vulnerability.package.name) || ('Alert #' + a.number)) + '</div>' +
+        '<div class="lsub">' + esc((a.security_vulnerability && a.security_vulnerability.severity) || 'unknown') + ' severity · ' + esc(a.state) + '</div></div></div>').join('') + '</div>' : '') +
+    '</div>';
+  html += '<div class="card"><div class="ltitle" style="padding:2px 4px 4px;font-size:15px">Dependabot version updates</div>' +
+    '<div class="setrow"><div class="lmain"><div class="ltitle">Automated security fixes</div>' +
+    '<div class="lsub">Let Dependabot open pull requests that update vulnerable dependencies</div></div>' +
+    '<button class="switch' + (fixOn ? ' on' : '') + '" id="secFixSw" aria-label="automated fixes"></button></div></div>';
+  html += '<div class="card"><div class="ltitle" style="padding:2px 4px 4px;font-size:15px">Secret scanning</div>' +
+    '<div class="setrow"><div class="lmain"><div class="ltitle">Scan for committed secrets</div>' +
+    '<div class="lsub">Get notified when tokens, keys and other secrets are pushed to this repository' +
+    (secret ? ' · currently ' + esc(secret.state) : '') + '</div></div>' +
+    '<button class="switch' + (secret && secret.state === 'enabled' ? ' on' : '') + '" id="secSecretSw" aria-label="secret scanning"></button></div></div>';
+  html += '<div class="card"><div class="ltitle" style="padding:2px 4px 4px;font-size:15px">Security policy</div>' +
+    '<div class="lrow" data-act="openfile" data-repo="' + esc(full) + '" data-file="SECURITY.md" style="padding:10px 0">' +
+    '<div class="lmain"><div class="ltitle">View SECURITY.md</div><div class="lsub">How users should report vulnerabilities for this repository</div></div></div>' +
+    '<div class="lrow" data-act="ext" data-url="https://github.com/' + esc(full) + '/security" style="padding:10px 0">' +
+    '<div class="lmain"><div class="ltitle">Security overview on GitHub</div><div class="lsub">Code scanning, advisories and full alert history</div></div></div></div>';
+  view().innerHTML = html;
+  if (!canAdmin) view().insertAdjacentHTML('afterbegin', '<div class="card empty">Read-only view — changing security settings requires admin access to this repository.</div>');
+  const dsw = $('#secDepSw');
+  if (dsw) dsw.addEventListener('click', async () => {
+    const on = !dsw.classList.contains('on');
+    try { await api('/repos/' + full + '/vulnerability-alerts', { method: on ? 'PUT' : 'DELETE' }); dsw.classList.toggle('on', on); toast(on ? 'Dependabot alerts enabled' : 'Dependabot alerts disabled'); if (on) setTimeout(() => renderSecurity(o, n), 800); }
+    catch (e) { toast('Failed: ' + e.message); }
+  });
+  const fsw = $('#secFixSw');
+  if (fsw) fsw.addEventListener('click', async () => {
+    const on = !fsw.classList.contains('on');
+    try { await api('/repos/' + full + '/automated-security-fixes', { method: on ? 'PUT' : 'DELETE' }); fsw.classList.toggle('on', on); toast(on ? 'Automated security fixes enabled' : 'Automated security fixes disabled'); }
+    catch (e) { toast('Failed: ' + e.message); }
+  });
+  const ssw = $('#secSecretSw');
+  if (ssw) ssw.addEventListener('click', async () => {
+    const on = !ssw.classList.contains('on');
+    try { await api('/repos/' + full + '/secret-scanning', { method: 'PATCH', body: JSON.stringify({ state: on ? 'enabled' : 'disabled' }) }); ssw.classList.toggle('on', on); toast(on ? 'Secret scanning enabled' : 'Secret scanning disabled'); }
+    catch (e) { toast('Failed: ' + e.message); }
+  });
+}
+
+/* ---------- insights (pulse) ---------- */
+async function renderInsights(o, n) {
+  const seq = ++RSEQ;
+  const full = o + '/' + n;
+  view().innerHTML = spinner();
+  const [contribs, activity, events] = await Promise.all([
+    api('/repos/' + full + '/stats/contributors').catch(() => null),
+    api('/repos/' + full + '/stats/commit_activity').catch(() => null),
+    api('/repos/' + full + '/events?per_page=15').catch(() => [])
+  ]);
+  if (seq !== RSEQ) return;
+  let html = '';
+  if (Array.isArray(contribs) && contribs.length) {
+    const sorted = contribs.slice().sort((a, b) => (b.total || 0) - (a.total || 0));
+    const max = sorted[0].total || 1;
+    html += '<h2 class="sect">Top contributors</h2><div class="card list">';
+    sorted.slice(0, 12).forEach(c => {
+      html += '<div class="lrow" data-go="#/user/' + esc(c.author ? c.author.login : '') + '">' +
+        (c.author ? '<img class="cav" src="' + esc(c.author.avatar_url) + '" alt="">' : SVG.user) +
+        '<div class="lmain"><div class="ltitle">' + esc(c.author ? c.author.login : 'unknown') + '</div>' +
+        '<div class="cbar"><span style="width:' + Math.round(100 * (c.total || 0) / max) + '%"></span></div></div>' +
+        '<div class="lsub" style="align-self:center">' + nf(c.total || 0) + ' commits</div></div>';
+    });
+    html += '</div>';
+  } else if (contribs && !Array.isArray(contribs)) {
+    html += '<div class="card empty">GitHub is still calculating contributor statistics — check back in a minute.</div>';
+  } else {
+    html += '<div class="card empty">No contributor statistics yet.</div>';
+  }
+  if (Array.isArray(activity) && activity.length) {
+    const maxW = Math.max.apply(null, activity.map(w => w.total || 0)) || 1;
+    html += '<h2 class="sect">Commits per week (last year)</h2><div class="card"><div class="wkchart">' +
+      activity.map(w => '<div class="wkbar" style="height:' + Math.max(3, Math.round(64 * (w.total || 0) / maxW)) + 'px" title="' + (w.total || 0) + ' commits"></div>').join('') +
+      '</div><div class="lsub" style="margin-top:10px">' + nf(activity.reduce((s, w) => s + (w.total || 0), 0)) + ' commits in the last 52 weeks</div></div>';
+  }
+  if (Array.isArray(events) && events.length) {
+    html += '<h2 class="sect">Recent activity</h2><div class="card list">' + events.map(ev => eventRow(ev)).join('') + '</div>';
+  }
+  view().innerHTML = html || '<div class="card empty">No insights available for this repository.</div>';
+}
+
+/* ---------- deployments sheet ---------- */
+async function deploymentsSheet(full) {
+  openSheet('<div class="sheethead"><b>Deployments</b><button class="iconbtn" data-act="closesheet">' + SVG.x + '</button></div>' + spinner(true));
+  const head = '<div class="sheethead"><b>Deployments</b><button class="iconbtn" data-act="closesheet">' + SVG.x + '</button></div>';
+  try {
+    const deps = await api('/repos/' + full + '/deployments?per_page=15');
+    if (!deps.length) { const c = $('.sheetcard'); if (c) c.innerHTML = head + '<div class="lsub">No deployments yet. Deployments appear when workflows or services publish environments.</div>'; return; }
+    const statii = await Promise.all(deps.map(d => api('/repos/' + full + '/deployments/' + d.id + '/statuses?per_page=1').catch(() => [])));
+    let html = head;
+    deps.forEach((d, i) => {
+      const st = statii[i] && statii[i][0] ? statii[i][0].state : '';
+      const ok = st === 'success', bad = st === 'failure' || st === 'error';
+      html += '<div class="lrow" style="padding:10px 0"' + (d.environment_url ? ' data-act="ext" data-url="' + esc(d.environment_url) + '"' : '') + '>' +
+        '<div class="lmain"><div class="ltitle">' + esc(d.environment || 'deployment') + ' · ' + (d.sha ? d.sha.slice(0, 7) : '') + '</div>' +
+        '<div class="lsub">' + tAgo(d.created_at) + (d.ref ? ' · ref ' + esc(d.ref) : '') + '</div></div>' +
+        (st ? '<span class="chip ' + (ok ? 'ok' : (bad ? 'closed' : '')) + '">' + esc(st) + '</span>' : '') + '</div>';
+    });
+    const c = $('.sheetcard'); if (c) c.innerHTML = html;
+  } catch (e) { const c = $('.sheetcard'); if (c) c.innerHTML = head + errCard(e); }
+}
+
+/* ---------- repo settings: pages / environments / interaction limits / protection ---------- */
+async function loadPages(o, n) {
+  const el = $('#pagesCard'); if (!el) return;
+  const full = o + '/' + n;
+  let p = null;
+  try { p = await api('/repos/' + full + '/pages'); } catch (e) {}
+  if (!p) {
+    el.innerHTML = '<div class="ltitle" style="padding:2px 4px 4px;font-size:15px">GitHub Pages</div>' +
+      '<div class="lsub" style="margin-bottom:10px">Publish a website straight from this repository.</div>' +
+      '<label class="fldlabel">Branch</label><select class="fld" id="pgBranch"></select>' +
+      '<label class="fldlabel" style="margin-top:12px">Folder</label><select class="fld" id="pgFolder"><option value="/">/ (root)</option><option value="/docs">/docs</option></select>' +
+      '<button class="btn primary btnblock" id="pgPublish" style="margin-top:16px">Publish site</button>';
+    const branches = await api('/repos/' + full + '/branches?per_page=100').catch(() => []);
+    const sel = $('#pgBranch');
+    if (sel) sel.innerHTML = branches.map(b => '<option value="' + esc(b.name) + '">' + esc(b.name) + '</option>').join('') || '<option value="main">main</option>';
+    const pb = $('#pgPublish');
+    if (pb) pb.addEventListener('click', async () => {
+      pb.disabled = true;
+      try {
+        await api('/repos/' + full + '/pages', { method: 'POST', body: JSON.stringify({ source: { branch: $('#pgBranch').value, path: $('#pgFolder').value } }) });
+        toast('Site published'); loadPages(o, n);
+      } catch (e) { toast('Failed: ' + e.message); pb.disabled = false; }
+    });
+    return;
+  }
+  el.innerHTML = '<div class="ltitle" style="padding:2px 4px 4px;font-size:15px">GitHub Pages</div>' +
+    '<div class="lrow" data-act="ext" data-url="' + esc(p.html_url) + '" style="padding:10px 0"><div class="lmain">' +
+    '<div class="ltitle">' + esc(p.html_url) + '</div><div class="lsub">' + esc(p.status || '') + ' · tap to visit site</div></div></div>' +
+    '<label class="fldlabel">Build from branch</label><select class="fld" id="pgBranch"></select>' +
+    '<label class="fldlabel" style="margin-top:12px">Folder</label><select class="fld" id="pgFolder"><option value="/">/ (root)</option><option value="/docs">/docs</option></select>' +
+    '<button class="btn ghost btnblock" id="pgSave" style="margin-top:14px">Save source</button>' +
+    '<label class="fldlabel" style="margin-top:16px">Custom domain</label><input class="fld" id="pgDomain" value="' + esc(p.cname || '') + '" placeholder="example.com" autocomplete="off">' +
+    '<button class="btn ghost btnblock" id="pgDomainSave" style="margin-top:14px">Save domain</button>' +
+    '<div class="setrow" style="margin-top:14px"><div class="lmain"><div class="ltitle">Enforce HTTPS</div><div class="lsub">Encrypts traffic to your Pages site</div></div>' +
+    '<button class="switch' + (p.https_enforced ? ' on' : '') + '" id="pgHttpsSw" aria-label="enforce https"></button></div>' +
+    '<button class="btn danger btnblock" id="pgUnpublish" style="margin-top:16px">Unpublish site</button>';
+  const branches = await api('/repos/' + full + '/branches?per_page=100').catch(() => []);
+  const sel = $('#pgBranch');
+  if (sel) {
+    sel.innerHTML = branches.map(b => '<option value="' + esc(b.name) + '"' + (p.source && b.name === p.source.branch ? ' selected' : '') + '>' + esc(b.name) + '</option>').join('');
+    if (sel.options.length && sel.selectedIndex === -1 && p.source) { /* keep first */ }
+    const fld = $('#pgFolder'); if (fld && p.source && p.source.path) fld.value = p.source.path;
+  }
+  const sv = $('#pgSave');
+  if (sv) sv.addEventListener('click', async () => {
+    try { await api('/repos/' + full + '/pages', { method: 'PUT', body: JSON.stringify({ source: { branch: $('#pgBranch').value, path: $('#pgFolder').value } }) }); toast('Pages source saved'); }
+    catch (e) { toast('Failed: ' + e.message); }
+  });
+  const ds = $('#pgDomainSave');
+  if (ds) ds.addEventListener('click', async () => {
+    const v = $('#pgDomain').value.trim();
+    try { await api('/repos/' + full + '/pages', { method: 'PUT', body: JSON.stringify(v ? { cname: v } : { cname: null }) }); toast('Domain saved'); }
+    catch (e) { toast('Failed: ' + e.message); }
+  });
+  const hs = $('#pgHttpsSw');
+  if (hs) hs.addEventListener('click', async () => {
+    const on = !hs.classList.contains('on');
+    try { await api('/repos/' + full + '/pages', { method: 'PUT', body: JSON.stringify({ https_enforced: on }) }); hs.classList.toggle('on', on); toast(on ? 'HTTPS enforced' : 'HTTPS not enforced'); }
+    catch (e) { toast('Failed: ' + e.message); }
+  });
+  const up = $('#pgUnpublish');
+  if (up) up.addEventListener('click', async () => {
+    if (!window.confirm('Unpublish the Pages site?')) return;
+    try { await api('/repos/' + full + '/pages', { method: 'DELETE' }); toast('Site unpublished'); loadPages(o, n); }
+    catch (e) { toast('Failed: ' + e.message); }
+  });
+}
+async function loadEnvs(o, n) {
+  const el = $('#rsEnvList'); if (!el) return;
+  const full = o + '/' + n;
+  try {
+    const res = await api('/repos/' + full + '/environments?per_page=30');
+    const envs = (res && res.environments) || [];
+    el.innerHTML = envs.length ? envs.map(e =>
+      '<div class="lrow" style="padding:10px 0"><div class="lmain"><div class="ltitle">' + esc(e.name) + '</div>' +
+      '<div class="lsub">' + ((e.protection_rules || []).length ? (e.protection_rules.length + ' protection rule' + (e.protection_rules.length > 1 ? 's' : '')) : 'no protection rules') + '</div></div>' +
+      '<button class="iconbtn" data-rmenv="' + esc(e.name) + '" aria-label="delete environment">' + SVG.x + '</button></div>').join('') :
+      '<div class="lsub" style="padding:10px 0">No environments yet.</div>';
+    el.querySelectorAll('[data-rmenv]').forEach(b => b.addEventListener('click', async () => {
+      if (!window.confirm('Delete environment ' + b.dataset.rmenv + '?')) return;
+      try { await api('/repos/' + full + '/environments/' + encodeURIComponent(b.dataset.rmenv), { method: 'DELETE' }); toast('Environment deleted'); loadEnvs(o, n); }
+      catch (e) { toast('Failed: ' + e.message); }
+    }));
+  } catch (e) { el.innerHTML = '<div class="lsub" style="padding:10px 0">Could not load environments: ' + esc(e.message) + '</div>'; }
+}
+async function loadIL(o, n) {
+  const el = $('#ilCard'); if (!el) return;
+  const full = o + '/' + n;
+  const r = await api('/repos/' + full + '/interaction-limits', { status: true }).catch(() => null);
+  const cur = (r && r.status === 200 && r.data) ? r.data : null;
+  const opts = [['', 'No limit — anyone can interact'], ['existing_users', 'Existing users only'], ['contributors_only', 'Prior contributors only'], ['collaborators_only', 'Collaborators only']];
+  const exps = [['one_day', '1 day'], ['three_days', '3 days'], ['one_week', '1 week'], ['one_month', '1 month'], ['six_months', '6 months']];
+  el.innerHTML = '<div class="ltitle" style="padding:2px 4px 4px;font-size:15px">Interaction limits</div>' +
+    '<div class="lsub" style="margin-bottom:10px">Temporarily restrict which users can comment, open issues or create pull requests here.</div>' +
+    '<label class="fldlabel">Limit</label><select class="fld" id="ilLimit">' +
+    opts.map(x => '<option value="' + x[0] + '"' + (cur && cur.limit === x[0] ? ' selected' : '') + '>' + x[1] + '</option>').join('') + '</select>' +
+    '<label class="fldlabel" style="margin-top:12px">Expires after</label><select class="fld" id="ilExpiry">' +
+    exps.map(x => '<option value="' + x[0] + '"' + (cur && cur.expiry === x[0] ? ' selected' : '') + '>' + x[1] + '</option>').join('') + '</select>' +
+    '<button class="btn primary btnblock" id="ilSave" style="margin-top:16px">Apply limit</button>' +
+    '<button class="btn danger btnblock" id="ilRemove" style="margin-top:8px">Remove limit</button>';
+  $('#ilSave').addEventListener('click', async () => {
+    const v = $('#ilLimit').value;
+    if (!v) { toast('Pick a limit type first'); return; }
+    try { await api('/repos/' + full + '/interaction-limits', { method: 'PUT', body: JSON.stringify({ limit: v, expiry: $('#ilExpiry').value }) }); toast('Interaction limit applied'); }
+    catch (e) { toast('Failed: ' + e.message); }
+  });
+  $('#ilRemove').addEventListener('click', async () => {
+    try { await api('/repos/' + full + '/interaction-limits', { method: 'DELETE' }); toast('Interaction limit removed'); loadIL(o, n); }
+    catch (e) { toast('Failed: ' + e.message); }
+  });
+}
+function protectionSheet(o, n, branch) {
+  const full = o + '/' + n;
+  openSheet('<div class="sheethead"><b>Protect ' + esc(branch) + '</b><button class="iconbtn" data-act="closesheet">' + SVG.x + '</button></div>' + spinner(true));
+  api('/repos/' + full + '/branches/' + encodeURIComponent(branch) + '/protection', { status: true }).then(r => {
+    const p = (r && r.status === 200 && r.data) ? r.data : null;
+    const rr = p && p.required_pull_request_reviews;
+    const sc = p && p.required_status_checks;
+    const cnt = (rr && typeof rr.required_approving_review_count === 'number') ? rr.required_approving_review_count : 1;
+    const c = $('.sheetcard'); if (!c) return;
+    c.innerHTML = '<div class="sheethead"><b>Protect ' + esc(branch) + '</b><button class="iconbtn" data-act="closesheet">' + SVG.x + '</button></div>' +
+      '<div class="setrow"><div class="lmain"><div class="ltitle">Require pull request reviews</div><div class="lsub">Before merging, at least the number of approvals below</div></div>' +
+      '<button class="switch' + (rr ? ' on' : '') + '" id="bpRev" aria-label="require reviews"></button></div>' +
+      '<label class="fldlabel" style="margin-top:12px">Required approvals</label><input class="fld" id="bpCnt" type="number" min="0" max="6" value="' + cnt + '">' +
+      '<div class="setrow" style="margin-top:14px"><div class="lmain"><div class="ltitle">Require status checks</div><div class="lsub">Block merging while required checks are failing</div></div>' +
+      '<button class="switch' + (sc ? ' on' : '') + '" id="bpSc" aria-label="require checks"></button></div>' +
+      '<div class="setrow" style="margin-top:14px"><div class="lmain"><div class="ltitle">Include administrators</div><div class="lsub">Admins must follow the same rules</div></div>' +
+      '<button class="switch' + (p && p.enforce_admins && p.enforce_admins.enabled ? ' on' : '') + '" id="bpAdm" aria-label="enforce admins"></button></div>' +
+      '<div class="setrow" style="margin-top:14px"><div class="lmain"><div class="ltitle">Allow force pushes</div><div class="lsub">Permit history rewrites on this branch</div></div>' +
+      '<button class="switch' + (p && p.allow_force_pushes && p.allow_force_pushes.enabled ? ' on' : '') + '" id="bpFp" aria-label="force pushes"></button></div>' +
+      '<div class="setrow" style="margin-top:14px"><div class="lmain"><div class="ltitle">Allow deletions</div><div class="lsub">Let this branch be deleted</div></div>' +
+      '<button class="switch' + (p && p.allow_deletions && p.allow_deletions.enabled ? ' on' : '') + '" id="bpDel" aria-label="allow deletions"></button></div>' +
+      '<button class="btn primary btnblock" id="bpSave" style="margin-top:16px">Save protection</button>' +
+      '<button class="btn danger btnblock" id="bpRemove" style="margin-top:8px">Remove protection</button>';
+    const gv = k => { const s = $('#' + k); return s && s.classList.contains('on'); };
+    $('#bpSave').addEventListener('click', async () => {
+      const body = {
+        required_status_checks: gv('bpSc') ? { strict: false, contexts: [] } : null,
+        enforce_admins: gv('bpAdm') ? true : false,
+        required_pull_request_reviews: gv('bpRev') ? { dismiss_stale_reviews: false, require_code_owner_reviews: false, required_approving_review_count: Math.max(0, Math.min(6, parseInt($('#bpCnt').value || '1', 10) || 1)) } : null,
+        restrictions: null,
+        allow_force_pushes: gv('bpFp') ? true : false,
+        allow_deletions: gv('bpDel') ? true : false
+      };
+      try { await api('/repos/' + full + '/branches/' + encodeURIComponent(branch) + '/protection', { method: 'PUT', body: JSON.stringify(body) }); toast('Protection saved for ' + branch); closeSheet(); }
+      catch (e) { toast('Failed: ' + e.message); }
+    });
+    $('#bpRemove').addEventListener('click', async () => {
+      if (!window.confirm('Remove branch protection from ' + branch + '?')) return;
+      try { await api('/repos/' + full + '/branches/' + encodeURIComponent(branch) + '/protection', { method: 'DELETE' }); toast('Protection removed'); closeSheet(); }
+      catch (e) { toast('Failed: ' + e.message); }
+    });
+  }).catch(e => { const c = $('.sheetcard'); if (c) c.innerHTML = '<div class="sheethead"><b>Protect ' + esc(branch) + '</b><button class="iconbtn" data-act="closesheet">' + SVG.x + '</button></div>' + errCard(e); });
+}
+function transferSheet(o, n) {
+  openSheet('<div class="sheethead"><b>Transfer repository</b><button class="iconbtn" data-act="closesheet">' + SVG.x + '</button></div>' +
+    '<div class="lsub">Moves this repository to another user or organization where you can create repositories.</div>' +
+    '<label class="fldlabel" style="margin-top:12px">New owner</label><input class="fld" id="tfOwner" placeholder="username or organization" autocomplete="off" spellcheck="false">' +
+    '<button class="btn danger btnblock" id="tfGo" style="margin-top:16px">Transfer ' + esc(o + '/' + n) + '</button>');
+  $('#tfGo').addEventListener('click', async () => {
+    const own = $('#tfOwner').value.trim();
+    if (!own) { toast('Enter the new owner'); return; }
+    if (!window.confirm('Transfer ' + o + '/' + n + ' to ' + own + '?')) return;
+    $('#tfGo').disabled = true;
+    try {
+      const r = await api('/repos/' + o + '/' + n + '/transfer', { method: 'POST', body: JSON.stringify({ new_owner: own }) });
+      closeSheet(); toast('Transferred to ' + own);
+      location.hash = '#/repo/' + own + '/' + ((r && r.name) ? r.name : n);
+    } catch (e) { toast('Failed: ' + e.message); $('#tfGo').disabled = false; }
+  });
+}
+
+/* ---------- account: SSH keys, GPG keys, organizations ---------- */
+/* ---------- watched repositories (notification sources, managed in-app) ---------- */
